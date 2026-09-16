@@ -10,6 +10,12 @@ Standalone Streamlit dashboard for public options-chain data. It shows dealer ga
 - Yahoo-derived ATM IV, expected move, Volt, and Delta Grower cards
 - Negative gamma is red; positive gamma is green
 
+## Version 1.2
+
+- CTA trend state is red for down/mixed and green for up
+- Historical signal tests below 50% are highlighted red
+- Removed the Position Plan section for a cleaner institutional view
+
 ## Run locally
 
 ```powershell

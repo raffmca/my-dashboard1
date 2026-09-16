@@ -11,7 +11,7 @@ import streamlit as st
 import yfinance as yf
 from scipy.stats import norm
 
-APP_VERSION = "Version 1.1"
+APP_VERSION = "Version 1.2"
 
 st.set_page_config(page_title="Gamma Surface", page_icon="◈", layout="wide")
 
