@@ -128,6 +128,18 @@ def money(value: float) -> str:
     return f"{sign}${amount:.0f}"
 
 
+def style_net_gex(values: pd.Series) -> list[str]:
+    max_abs = max(float(values.abs().max()), 1.0)
+    styles = []
+    for value in values:
+        intensity = min(abs(float(value)) / max_abs, 1.0)
+        if value >= 0:
+            styles.append(f"background-color: rgba(40, 215, 161, {0.12 + intensity * 0.55:.2f}); color: #dce5ef")
+        else:
+            styles.append(f"background-color: rgba(255, 85, 125, {0.12 + intensity * 0.55:.2f}); color: #dce5ef")
+    return styles
+
+
 def render_chart(frame: pd.DataFrame, spot: float, levels: dict[str, float | str], symbol: str) -> None:
     chart = go.Figure()
     chart.add_trace(go.Bar(y=frame["strike"], x=frame["Net_GEX"] / 1_000_000, orientation="h", marker_color=np.where(frame["Net_GEX"] >= 0, "#28d7a1", "#ff557d"), hovertemplate="Strike %{y:.2f}<br>Net GEX $%{x:.2f}M<extra></extra>"))
@@ -188,7 +200,10 @@ def main() -> None:
     st.subheader("Strike matrix")
     display = frame[["strike", "Call_GEX", "Net_GEX", "Put_GEX"]].copy()
     display.columns = ["Strike", "Call GEX", "Net GEX", "Put GEX"]
-    st.dataframe(display.style.format({"Strike": "${:.2f}", "Call GEX": money, "Net GEX": money, "Put GEX": money}).background_gradient(subset=["Net GEX"], cmap="RdYlGn", vmin=-max(abs(display["Net GEX"]).max(), 1), vmax=max(abs(display["Net GEX"]).max(), 1)), use_container_width=True, hide_index=True, height=390)
+    styled_display = display.style.format(
+        {"Strike": "${:.2f}", "Call GEX": money, "Net GEX": money, "Put GEX": money}
+    ).apply(style_net_gex, subset=["Net GEX"])
+    st.dataframe(styled_display, use_container_width=True, hide_index=True, height=390)
 
 
 if __name__ == "__main__":
