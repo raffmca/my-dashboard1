@@ -186,6 +186,88 @@ def render_matrix(frame: pd.DataFrame, spot: float, levels: dict[str, float | st
     )
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def load_price_history(symbol: str, period: str = "2y") -> pd.DataFrame:
+    history = yf.Ticker(symbol).history(period=period, auto_adjust=False)
+    return history[["Open", "High", "Low", "Close", "Volume"]].dropna()
+
+
+def calculate_institutional_layers(
+    calls: pd.DataFrame,
+    puts: pd.DataFrame,
+    spot: float,
+    expiration: str,
+    history: pd.DataFrame,
+) -> dict[str, Any]:
+    days_to_expiry = max((date.fromisoformat(expiration) - date.today()).days, 1)
+    time = days_to_expiry / 365
+    layers: dict[str, Any] = {}
+    for options, sign in ((calls, 1.0), (puts, -1.0)):
+        volatility = options["impliedVolatility"].clip(lower=0.01)
+        d1 = (np.log(spot / options["strike"]) + (0.045 + 0.5 * volatility**2) * time) / (volatility * np.sqrt(time))
+        d2 = d1 - volatility * np.sqrt(time)
+        vega = spot * norm.pdf(d1) * np.sqrt(time)
+        charm = -norm.pdf(d1) * (2 * 0.045 * time - d2 * volatility * np.sqrt(time)) / (2 * time * volatility * np.sqrt(time))
+        vanna = -vega * d2 / (spot * volatility)
+        layers.setdefault("vanna", 0.0)
+        layers.setdefault("charm", 0.0)
+        layers["vanna"] += float((vanna * options["openInterest"] * 100 * sign).sum())
+        layers["charm"] += float((charm * options["openInterest"] * 100 * sign).sum())
+
+    if history.empty:
+        layers.update({"cta": "Unavailable", "cta_detail": "No price history", "breadth": "Unavailable", "breadth_detail": "No ETF history", "backtest": "Unavailable", "win_rate": 0.0})
+    else:
+        close = history["Close"]
+        sma20 = close.rolling(20).mean().iloc[-1]
+        sma50 = close.rolling(50).mean().iloc[-1]
+        sma200 = close.rolling(200).mean().iloc[-1]
+        cta_up = close.iloc[-1] > sma50 and sma50 > sma200
+        layers["cta"] = "TREND UP" if cta_up else "TREND DOWN / MIXED"
+        layers["cta_detail"] = f"Price ${close.iloc[-1]:.2f} · SMA20 ${sma20:.2f} · SMA50 ${sma50:.2f}"
+        signal = close > close.rolling(50).mean()
+        next_returns = close.pct_change().shift(-1)
+        samples = next_returns[signal].dropna()
+        layers["win_rate"] = float((samples > 0).mean() * 100) if len(samples) else 0.0
+        layers["backtest"] = f"{layers['win_rate']:.0f}% hit rate · {len(samples)} signals"
+        layers["breadth"] = "SINGLE-ASSET PROXY"
+        layers["breadth_detail"] = "Add QQQ / IWM confirmation with Tradier"
+
+    atm_iv = float(np.nanmean([
+        calls.loc[(calls["strike"] - spot).abs().idxmin(), "impliedVolatility"],
+        puts.loc[(puts["strike"] - spot).abs().idxmin(), "impliedVolatility"],
+    ]))
+    layers["atm_iv"] = atm_iv
+    layers["expected_move"] = spot * atm_iv * np.sqrt(days_to_expiry / 365)
+    return layers
+
+
+def render_institutional_layers(layers: dict[str, Any], spot: float) -> None:
+    st.markdown("<div class='layer-title'>INSTITUTIONAL LAYERS <span>YAHOO-DERIVED SAMPLE · NOT INVESTMENT ADVICE</span></div>", unsafe_allow_html=True)
+    vanna_class = "layer-negative" if layers["vanna"] < 0 else ""
+    charm_class = "layer-negative" if layers["charm"] < 0 else ""
+    st.markdown(
+        f"<div class='layer-grid'>"
+        f"<div class='layer-card'><div class='layer-label'>Vanna Exposure <span>PROXY</span></div><div class='layer-value {vanna_class}'>{money(layers['vanna'])}</div><div class='layer-note'>IV sensitivity × OI</div></div>"
+        f"<div class='layer-card'><div class='layer-label'>Charm Exposure <span>PROXY</span></div><div class='layer-value {charm_class}'>{money(layers['charm'])}</div><div class='layer-note'>Time decay × OI</div></div>"
+        f"<div class='layer-card'><div class='layer-label'>IV Rank / Expected Move</div><div class='layer-value gold'>{layers['atm_iv'] * 100:.1f}% / ±${layers['expected_move']:.2f}</div><div class='layer-note'>IV rank unavailable from Yahoo</div></div>"
+        f"<div class='layer-card'><div class='layer-label'>CTA Trend State</div><div class='layer-value'>{layers['cta']}</div><div class='layer-note'>{layers['cta_detail']}</div></div>"
+        f"<div class='layer-card'><div class='layer-label'>Breadth Confirmation</div><div class='layer-value gold'>{layers['breadth']}</div><div class='layer-note'>{layers['breadth_detail']}</div></div>"
+        f"<div class='layer-card'><div class='layer-label'>Historical Signal Test</div><div class='layer-value'>{layers['backtest']}</div><div class='layer-note'>Close above 50-day SMA · next-day return</div></div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown("<div class='layer-title'>POSITION PLAN <span>USER-DEFINED RISK</span></div>", unsafe_allow_html=True)
+    risk_columns = st.columns(4)
+    account_size = risk_columns[0].number_input("Account value", min_value=1000.0, value=25000.0, step=1000.0, key="account_size")
+    risk_percent = risk_columns[1].number_input("Risk per trade %", min_value=0.1, max_value=5.0, value=1.0, step=0.1, key="risk_percent")
+    stop_percent = risk_columns[2].number_input("Stop distance %", min_value=0.25, max_value=20.0, value=1.0, step=0.25, key="stop_percent")
+    reward_ratio = risk_columns[3].number_input("Reward / risk", min_value=1.0, max_value=5.0, value=2.0, step=0.5, key="reward_ratio")
+    risk_amount = account_size * risk_percent / 100
+    stop_distance = spot * stop_percent / 100
+    shares = int(risk_amount / stop_distance) if stop_distance else 0
+    st.markdown(f"<div class='plan-bar'><span>RISK BUDGET <b>${risk_amount:,.0f}</b></span><span>SIZE <b>{shares:,} shares</b></span><span>STOP <b>${spot - stop_distance:.2f}</b></span><span>TARGET <b>${spot + stop_distance * reward_ratio:.2f}</b></span><span>R:R <b>1:{reward_ratio:.1f}</b></span></div>", unsafe_allow_html=True)
+
+
 def render_chart(frame: pd.DataFrame, spot: float, levels: dict[str, float | str], symbol: str) -> None:
     max_exposure = max(
         float(frame[["Call_GEX", "Put_GEX"]].abs().to_numpy().max()) / 1_000_000,
@@ -303,12 +385,33 @@ def main() -> None:
     .summary-card-value.negative { color:#ff557d; }
     .summary-card-value.gold { color:#f5c84b; }
     .summary-card-note { color:#8796a8; font:400 .61rem 'DM Mono',monospace; margin-top:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .layer-title { color:#dce5ef; border-bottom:1px solid #243140; margin:26px 0 10px; padding-bottom:8px; font:600 .8rem 'DM Mono',monospace; letter-spacing:.1em; }
+    .layer-title span { color:#8796a8; font-size:.62rem; margin-left:8px; }
+    .layer-grid { display:grid; grid-template-columns:repeat(3, minmax(180px, 1fr)); gap:8px; }
+    .layer-card { min-height:82px; border:1px solid #243140; border-radius:6px; padding:11px 13px; background:#0f1822; }
+    .layer-label { color:#8796a8; font:500 .66rem 'DM Mono',monospace; text-transform:uppercase; }
+    .layer-label span { color:#aa7cff; font-size:.56rem; }
+    .layer-value { color:#28d7a1; font:600 .95rem 'DM Mono',monospace; margin-top:9px; }
+    .layer-value.gold { color:#f5c84b; }
+    .layer-value.layer-negative { color:#ff557d; }
+    .layer-note { color:#8796a8; font:400 .62rem 'DM Mono',monospace; margin-top:5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .plan-bar { display:flex; flex-wrap:wrap; gap:18px; border:1px solid #243140; background:#111a24; color:#8796a8; padding:13px; font:400 .7rem 'DM Mono',monospace; }
+    .plan-bar b { color:#f5c84b; font-weight:500; }
+    @media (max-width: 900px) { .layer-grid { grid-template-columns:repeat(2, minmax(160px, 1fr)); } }
+    @media (max-width: 560px) { .layer-grid { grid-template-columns:1fr; } }
     </style>
     """, unsafe_allow_html=True)
     st.sidebar.markdown(f"<div class='terminal-label'>GAMMA SURFACE / PUBLIC DATA · {APP_VERSION.upper()}</div>", unsafe_allow_html=True)
     symbol = st.sidebar.text_input("Symbol", "SPY", max_chars=8).strip().upper()
     st.sidebar.caption("Yahoo Finance · delayed market data")
     refresh = st.sidebar.button("Refresh data", use_container_width=True, type="primary")
+    if "show_layers" not in st.session_state:
+        st.session_state.show_layers = False
+    if st.sidebar.button(
+        "Hide institutional layers" if st.session_state.show_layers else "Add institutional layers",
+        use_container_width=True,
+    ):
+        st.session_state.show_layers = not st.session_state.show_layers
     if refresh:
         load_market_data.clear()
         load_chain.clear()
@@ -367,6 +470,13 @@ def main() -> None:
         "</div>",
         unsafe_allow_html=True,
     )
+    if st.session_state.show_layers:
+        try:
+            history = load_price_history(symbol)
+            layers = calculate_institutional_layers(calls, puts, spot, expiration, history)
+            render_institutional_layers(layers, spot)
+        except Exception as exc:
+            st.warning(f"Institutional layers unavailable: {exc}")
 
 
 if __name__ == "__main__":
