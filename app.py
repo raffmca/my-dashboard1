@@ -210,15 +210,29 @@ def render_chart(frame: pd.DataFrame, spot: float, levels: dict[str, float | str
         x=[0],
         y=[float(levels["max_pain"])],
         mode="markers+text",
-        marker=dict(symbol="diamond", size=12, color="#f5c84b", line=dict(color="#fff1a6", width=1)),
-        text=[f"MAX PAIN ${float(levels['max_pain']):.2f}"],
-        textposition="middle right",
-        textfont=dict(color="#f5c84b", size=10),
+        marker=dict(symbol="diamond", size=16, color="#f5c84b", line=dict(color="#080d14", width=3)),
+        text=[""],
         name="Max pain",
         hovertemplate="Max pain %{y:.2f}<extra></extra>",
     ))
     chart.add_vline(x=0, line_color="#5e6b7d", line_width=1)
     chart.add_hline(y=spot, line_color="#f5c84b", line_width=2, annotation_text=f"SPOT ${spot:.2f}", annotation_position="top left", annotation_font_color="#f5c84b")
+    chart.add_hline(y=float(levels["max_pain"]), line_color="#f5c84b", line_dash="dash", line_width=1.5, opacity=0.9)
+    chart.add_annotation(
+        x=0,
+        y=float(levels["max_pain"]),
+        text=f"MAX PAIN ${float(levels['max_pain']):.2f}",
+        showarrow=True,
+        arrowhead=2,
+        arrowcolor="#f5c84b",
+        ax=0,
+        ay=-34,
+        bgcolor="#111a24",
+        bordercolor="#f5c84b",
+        borderwidth=1,
+        borderpad=4,
+        font=dict(color="#f5c84b", size=10),
+    )
     for key, color in (("call_wall", "#28d7a1"), ("put_wall", "#ff557d"), ("gamma_flip", "#aa7cff")):
         chart.add_hline(y=float(levels[key]), line_color=color, line_dash="dot", line_width=1, annotation_text=f"{key.replace('_', ' ').upper()} ${float(levels[key]):.2f}", annotation_font_color=color, annotation_position="top right")
     chart.update_layout(
