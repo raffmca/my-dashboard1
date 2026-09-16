@@ -245,27 +245,19 @@ def render_institutional_layers(layers: dict[str, Any], spot: float) -> None:
     st.markdown("<div class='layer-title'>INSTITUTIONAL LAYERS <span>YAHOO-DERIVED SAMPLE · NOT INVESTMENT ADVICE</span></div>", unsafe_allow_html=True)
     vanna_class = "layer-negative" if layers["vanna"] < 0 else ""
     charm_class = "layer-negative" if layers["charm"] < 0 else ""
+    cta_class = "layer-positive" if layers["cta"] == "TREND UP" else "layer-negative"
+    backtest_class = "layer-negative" if layers["win_rate"] < 50 else "layer-positive"
     st.markdown(
         f"<div class='layer-grid'>"
         f"<div class='layer-card'><div class='layer-label'>Vanna Exposure <span>PROXY</span></div><div class='layer-value {vanna_class}'>{money(layers['vanna'])}</div><div class='layer-note'>IV sensitivity × OI</div></div>"
         f"<div class='layer-card'><div class='layer-label'>Charm Exposure <span>PROXY</span></div><div class='layer-value {charm_class}'>{money(layers['charm'])}</div><div class='layer-note'>Time decay × OI</div></div>"
         f"<div class='layer-card'><div class='layer-label'>IV Rank / Expected Move</div><div class='layer-value gold'>{layers['atm_iv'] * 100:.1f}% / ±${layers['expected_move']:.2f}</div><div class='layer-note'>IV rank unavailable from Yahoo</div></div>"
-        f"<div class='layer-card'><div class='layer-label'>CTA Trend State</div><div class='layer-value'>{layers['cta']}</div><div class='layer-note'>{layers['cta_detail']}</div></div>"
+        f"<div class='layer-card'><div class='layer-label'>CTA Trend State</div><div class='layer-value {cta_class}'>{layers['cta']}</div><div class='layer-note'>{layers['cta_detail']}</div></div>"
         f"<div class='layer-card'><div class='layer-label'>Breadth Confirmation</div><div class='layer-value gold'>{layers['breadth']}</div><div class='layer-note'>{layers['breadth_detail']}</div></div>"
-        f"<div class='layer-card'><div class='layer-label'>Historical Signal Test</div><div class='layer-value'>{layers['backtest']}</div><div class='layer-note'>Close above 50-day SMA · next-day return</div></div>"
+        f"<div class='layer-card'><div class='layer-label'>Historical Signal Test</div><div class='layer-value {backtest_class}'>{layers['backtest']}</div><div class='layer-note'>Close above 50-day SMA · next-day return</div></div>"
         "</div>",
         unsafe_allow_html=True,
     )
-    st.markdown("<div class='layer-title'>POSITION PLAN <span>USER-DEFINED RISK</span></div>", unsafe_allow_html=True)
-    risk_columns = st.columns(4)
-    account_size = risk_columns[0].number_input("Account value", min_value=1000.0, value=25000.0, step=1000.0, key="account_size")
-    risk_percent = risk_columns[1].number_input("Risk per trade %", min_value=0.1, max_value=5.0, value=1.0, step=0.1, key="risk_percent")
-    stop_percent = risk_columns[2].number_input("Stop distance %", min_value=0.25, max_value=20.0, value=1.0, step=0.25, key="stop_percent")
-    reward_ratio = risk_columns[3].number_input("Reward / risk", min_value=1.0, max_value=5.0, value=2.0, step=0.5, key="reward_ratio")
-    risk_amount = account_size * risk_percent / 100
-    stop_distance = spot * stop_percent / 100
-    shares = int(risk_amount / stop_distance) if stop_distance else 0
-    st.markdown(f"<div class='plan-bar'><span>RISK BUDGET <b>${risk_amount:,.0f}</b></span><span>SIZE <b>{shares:,} shares</b></span><span>STOP <b>${spot - stop_distance:.2f}</b></span><span>TARGET <b>${spot + stop_distance * reward_ratio:.2f}</b></span><span>R:R <b>1:{reward_ratio:.1f}</b></span></div>", unsafe_allow_html=True)
 
 
 def render_chart(frame: pd.DataFrame, spot: float, levels: dict[str, float | str], symbol: str) -> None:
@@ -394,9 +386,8 @@ def main() -> None:
     .layer-value { color:#28d7a1; font:600 .95rem 'DM Mono',monospace; margin-top:9px; }
     .layer-value.gold { color:#f5c84b; }
     .layer-value.layer-negative { color:#ff557d; }
+    .layer-value.layer-positive { color:#28d7a1; }
     .layer-note { color:#8796a8; font:400 .62rem 'DM Mono',monospace; margin-top:5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-    .plan-bar { display:flex; flex-wrap:wrap; gap:18px; border:1px solid #243140; background:#111a24; color:#8796a8; padding:13px; font:400 .7rem 'DM Mono',monospace; }
-    .plan-bar b { color:#f5c84b; font-weight:500; }
     @media (max-width: 900px) { .layer-grid { grid-template-columns:repeat(2, minmax(160px, 1fr)); } }
     @media (max-width: 560px) { .layer-grid { grid-template-columns:1fr; } }
     </style>
