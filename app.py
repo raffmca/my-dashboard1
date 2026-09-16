@@ -177,7 +177,7 @@ def render_matrix(frame: pd.DataFrame, spot: float, levels: dict[str, float | st
         )
     st.markdown(
         "<div class='matrix'>"
-        "<div class='matrix-head'><div>STRIKE</div><div>CALL GEX</div><div>NET GEX</div><div>PUT GEX</div></div>"
+        "<div class='matrix-head'><div>STRIKE</div><div class='right'>CALL GEX</div><div class='right'>NET GEX</div><div class='right'>PUT GEX</div></div>"
         + "".join(rows)
         + "</div>",
         unsafe_allow_html=True,
@@ -267,6 +267,7 @@ def main() -> None:
     .matrix-head, .matrix-row { display:grid; grid-template-columns: 1fr 1.2fr 1.6fr 1.2fr; align-items:center; min-height:32px; border-bottom:1px solid #1c2937; }
     .matrix-head { background:#162231; color:#8796a8; font-size:.64rem; letter-spacing:.1em; }
     .matrix-head > div, .matrix-row > div { padding:7px 12px; }
+    .matrix-head .right { text-align:right; }
     .matrix-row { color:#dce5ef; }
     .matrix-row:hover { background:#182533; }
     .strike-cell { color:#dce5ef; font-weight:600; }
@@ -278,6 +279,13 @@ def main() -> None:
     .row-marker { color:#f5c84b; font-size:.58rem; margin-left:8px; }
     .gold-row { background:rgba(245,200,75,.13); box-shadow:inset 3px 0 #f5c84b; }
     .spot-row { background:rgba(245,200,75,.06); box-shadow:inset 3px 0 #8c7430; }
+    .summary-strip { display:grid; grid-template-columns:repeat(7, minmax(125px, 1fr)); gap:8px; margin-top:18px; overflow-x:auto; }
+    .summary-card { min-height:76px; padding:10px 12px; border:1px solid #243140; border-radius:6px; background:#111a24; }
+    .summary-card-label { color:#dce5ef; font:600 .64rem 'Space Grotesk',sans-serif; text-transform:uppercase; white-space:nowrap; }
+    .summary-card-value { color:#28d7a1; font:600 1rem 'DM Mono',monospace; margin-top:7px; white-space:nowrap; }
+    .summary-card-value.negative { color:#ff557d; }
+    .summary-card-value.gold { color:#f5c84b; }
+    .summary-card-note { color:#8796a8; font:400 .61rem 'DM Mono',monospace; margin-top:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
     </style>
     """, unsafe_allow_html=True)
     st.sidebar.markdown("<div class='terminal-label'>GAMMA SURFACE / PUBLIC DATA</div>", unsafe_allow_html=True)
@@ -304,6 +312,18 @@ def main() -> None:
     frame = build_gex_frame(calls, puts, spot, expiration)
     levels = find_levels(frame, spot)
     total = float(frame["Net_GEX"].sum())
+    days_to_expiry = max((date.fromisoformat(expiration) - date.today()).days, 1)
+    spot_strike = float(frame.loc[(frame["strike"] - spot).abs().idxmin(), "strike"])
+    nearest_call = calls.loc[(calls["strike"] - spot).abs().idxmin()]
+    nearest_put = puts.loc[(puts["strike"] - spot).abs().idxmin()]
+    atm_iv = float(np.nanmean([nearest_call["impliedVolatility"], nearest_put["impliedVolatility"]]))
+    implied_move = spot * atm_iv * np.sqrt(days_to_expiry / 365)
+    volt_strike = spot_strike
+    try:
+        daily_open = float(yf.Ticker(symbol).history(period="5d", auto_adjust=False)["Open"].dropna().iloc[-1])
+    except Exception:
+        daily_open = spot
+    grower = spot - daily_open
     st.markdown(f"<div class='regime'>{levels['regime']} <span style='color:#8796a8'>· {expiration} · SOURCE: YAHOO FINANCE</span></div>", unsafe_allow_html=True)
     metrics = st.columns(5)
     metrics[0].metric("Spot", f"${spot:.2f}")
@@ -314,11 +334,20 @@ def main() -> None:
     render_chart(frame, spot, levels, symbol)
     st.subheader("Strike matrix")
     render_matrix(frame, spot, levels)
-    summary = st.columns(4)
-    summary[0].markdown(f"**NET GEX · {expiration}**\n\n<span class='summary-value'>{money(total)}</span>\n\n<span class='summary-note'>{levels['regime']}</span>", unsafe_allow_html=True)
-    summary[1].markdown(f"**CALL WALL · {expiration}**\n\n<span class='summary-value'>${float(levels['call_wall']):.2f}</span>\n\n<span class='summary-note'>{float(levels['call_wall']) - spot:+.2f} from spot</span>", unsafe_allow_html=True)
-    summary[2].markdown(f"**MAX PAIN · {expiration}**\n\n<span class='summary-value'>${float(levels['max_pain']):.2f}</span>\n\n<span class='summary-note'>{float(levels['max_pain']) - spot:+.2f} from spot</span>", unsafe_allow_html=True)
-    summary[3].markdown(f"**GAMMA FLIP · {expiration}**\n\n<span class='summary-value'>{float(levels['gamma_flip']):.2f}</span>\n\n<span class='summary-note'>{float(levels['gamma_flip']) - spot:+.2f} from spot</span>", unsafe_allow_html=True)
+    total_class = "" if total >= 0 else " negative"
+    grower_class = "" if grower >= 0 else " negative"
+    st.markdown(
+        f"<div class='summary-strip'>"
+        f"<div class='summary-card'><div class='summary-card-label'>Net GEX · {expiration}</div><div class='summary-card-value{total_class}'>{money(total)}</div><div class='summary-card-note'>{levels['regime']}</div></div>"
+        f"<div class='summary-card'><div class='summary-card-label'>Call Wall · {expiration}</div><div class='summary-card-value'>${float(levels['call_wall']):.2f}</div><div class='summary-card-note'>{float(levels['call_wall']) - spot:+.2f} from spot</div></div>"
+        f"<div class='summary-card'><div class='summary-card-label'>Volt · {expiration}</div><div class='summary-card-value gold'>${volt_strike:.0f}</div><div class='summary-card-note'>nearest listed strike</div></div>"
+        f"<div class='summary-card'><div class='summary-card-label'>Gamma Flip · {expiration}</div><div class='summary-card-value'>${float(levels['gamma_flip']):.2f}</div><div class='summary-card-note'>{float(levels['gamma_flip']) - spot:+.2f} from spot</div></div>"
+        f"<div class='summary-card'><div class='summary-card-label'>Δ Grower · all dates</div><div class='summary-card-value{grower_class}'>${spot:.2f} {grower:+.1f}</div><div class='summary-card-note'>derived from daily open</div></div>"
+        f"<div class='summary-card'><div class='summary-card-label'>± Move · {expiration}</div><div class='summary-card-value gold'>±${implied_move:.2f}</div><div class='summary-card-note'>ATM IV implied range</div></div>"
+        f"<div class='summary-card'><div class='summary-card-label'>ATM IV · {expiration}</div><div class='summary-card-value gold'>{atm_iv * 100:.1f}%</div><div class='summary-card-note'>call/put midpoint</div></div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
 
 
 if __name__ == "__main__":
