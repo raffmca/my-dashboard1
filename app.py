@@ -274,6 +274,7 @@ def main() -> None:
     section[data-testid='stSidebar'] { background:#0b121b; border-right:1px solid #243140; }
     .terminal-label { color:#8796a8; font:500 .7rem 'DM Mono',monospace; letter-spacing:.14em; text-transform:uppercase; }
     .regime { border-left:3px solid #28d7a1; background:#101b25; padding:12px 16px; margin:4px 0 18px; color:#28d7a1; font:500 .78rem 'DM Mono',monospace; letter-spacing:.08em; }
+    .regime.negative { border-left-color:#ff557d; color:#ff557d; }
     .summary-value { color:#f5c84b; font:600 1.1rem 'DM Mono',monospace; }
     .summary-note { color:#8796a8; font:400 .7rem 'DM Mono',monospace; }
     [data-testid='stMarkdownContainer'] .summary-value { line-height:1.8; }
@@ -338,7 +339,8 @@ def main() -> None:
     except Exception:
         daily_open = spot
     grower = spot - daily_open
-    st.markdown(f"<div class='regime'>{levels['regime']} <span style='color:#8796a8'>· {expiration} · SOURCE: YAHOO FINANCE</span></div>", unsafe_allow_html=True)
+    regime_class = " negative" if total < 0 else ""
+    st.markdown(f"<div class='regime{regime_class}'>{levels['regime']} <span style='color:#8796a8'>· {expiration} · SOURCE: YAHOO FINANCE</span></div>", unsafe_allow_html=True)
     metrics = st.columns(5)
     metrics[0].metric("Spot", f"${spot:.2f}")
     metrics[1].metric("Net GEX", money(total))
