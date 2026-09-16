@@ -279,7 +279,7 @@ def main() -> None:
     .row-marker { color:#f5c84b; font-size:.58rem; margin-left:8px; }
     .gold-row { background:rgba(245,200,75,.13); box-shadow:inset 3px 0 #f5c84b; }
     .spot-row { background:rgba(245,200,75,.06); box-shadow:inset 3px 0 #8c7430; }
-    .summary-strip { display:grid; grid-template-columns:repeat(7, minmax(125px, 1fr)); gap:8px; margin-top:18px; overflow-x:auto; }
+    .summary-strip { display:grid; grid-template-columns:repeat(8, minmax(125px, 1fr)); gap:8px; margin-top:18px; overflow-x:auto; }
     .summary-card { min-height:76px; padding:10px 12px; border:1px solid #243140; border-radius:6px; background:#111a24; }
     .summary-card-label { color:#dce5ef; font:600 .64rem 'Space Grotesk',sans-serif; text-transform:uppercase; white-space:nowrap; }
     .summary-card-value { color:#28d7a1; font:600 1rem 'DM Mono',monospace; margin-top:7px; white-space:nowrap; }
@@ -342,6 +342,7 @@ def main() -> None:
         f"<div class='summary-card'><div class='summary-card-label'>Call Wall · {expiration}</div><div class='summary-card-value'>${float(levels['call_wall']):.2f}</div><div class='summary-card-note'>{float(levels['call_wall']) - spot:+.2f} from spot</div></div>"
         f"<div class='summary-card'><div class='summary-card-label'>Volt · {expiration}</div><div class='summary-card-value gold'>${volt_strike:.0f}</div><div class='summary-card-note'>nearest listed strike</div></div>"
         f"<div class='summary-card'><div class='summary-card-label'>Gamma Flip · {expiration}</div><div class='summary-card-value'>${float(levels['gamma_flip']):.2f}</div><div class='summary-card-note'>{float(levels['gamma_flip']) - spot:+.2f} from spot</div></div>"
+        f"<div class='summary-card'><div class='summary-card-label'>Max Pain · {expiration}</div><div class='summary-card-value gold'>${float(levels['max_pain']):.2f}</div><div class='summary-card-note'>{float(levels['max_pain']) - spot:+.2f} from spot</div></div>"
         f"<div class='summary-card'><div class='summary-card-label'>Δ Grower · all dates</div><div class='summary-card-value{grower_class}'>${spot:.2f} {grower:+.1f}</div><div class='summary-card-note'>derived from daily open</div></div>"
         f"<div class='summary-card'><div class='summary-card-label'>± Move · {expiration}</div><div class='summary-card-value gold'>±${implied_move:.2f}</div><div class='summary-card-note'>ATM IV implied range</div></div>"
         f"<div class='summary-card'><div class='summary-card-label'>ATM IV · {expiration}</div><div class='summary-card-value gold'>{atm_iv * 100:.1f}%</div><div class='summary-card-note'>call/put midpoint</div></div>"
