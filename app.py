@@ -141,13 +141,52 @@ def style_net_gex(values: pd.Series) -> list[str]:
 
 
 def render_chart(frame: pd.DataFrame, spot: float, levels: dict[str, float | str], symbol: str) -> None:
+    max_exposure = max(
+        float(frame[["Call_GEX", "Put_GEX"]].abs().to_numpy().max()) / 1_000_000,
+        1.0,
+    )
     chart = go.Figure()
-    chart.add_trace(go.Bar(y=frame["strike"], x=frame["Net_GEX"] / 1_000_000, orientation="h", marker_color=np.where(frame["Net_GEX"] >= 0, "#28d7a1", "#ff557d"), hovertemplate="Strike %{y:.2f}<br>Net GEX $%{x:.2f}M<extra></extra>"))
+    chart.add_trace(go.Bar(
+        y=frame["strike"],
+        x=frame["Put_GEX"] / 1_000_000,
+        orientation="h",
+        name="Put GEX",
+        marker_color="#ff557d",
+        hovertemplate="Strike %{y:.2f}<br>Put GEX $%{x:.2f}M<extra></extra>",
+    ))
+    chart.add_trace(go.Bar(
+        y=frame["strike"],
+        x=frame["Call_GEX"] / 1_000_000,
+        orientation="h",
+        name="Call GEX",
+        marker_color="#28d7a1",
+        hovertemplate="Strike %{y:.2f}<br>Call GEX $%{x:.2f}M<extra></extra>",
+    ))
     chart.add_vline(x=0, line_color="#5e6b7d", line_width=1)
     chart.add_hline(y=spot, line_color="#f5c84b", line_width=2, annotation_text=f"SPOT ${spot:.2f}", annotation_position="top left")
     for key, color in (("call_wall", "#28d7a1"), ("put_wall", "#ff557d"), ("gamma_flip", "#aa7cff")):
         chart.add_hline(y=float(levels[key]), line_color=color, line_dash="dot", line_width=1, annotation_text=key.replace("_", " ").upper(), annotation_font_color=color)
-    chart.update_layout(height=570, template="plotly_dark", paper_bgcolor="#080d14", plot_bgcolor="#080d14", margin=dict(l=10, r=18, t=20, b=20), showlegend=False, xaxis_title="Net GEX ($M)", yaxis_title="Strike", title=f"{symbol} / NET DEALER GAMMA")
+    chart.update_layout(
+        height=570,
+        template="plotly_dark",
+        paper_bgcolor="#080d14",
+        plot_bgcolor="#080d14",
+        margin=dict(l=10, r=18, t=42, b=20),
+        barmode="relative",
+        showlegend=False,
+        xaxis=dict(
+            title="Dealer GEX ($M)",
+            range=[-max_exposure * 1.12, max_exposure * 1.12],
+            zeroline=False,
+            gridcolor="#1b2735",
+        ),
+        yaxis=dict(
+            title="Strike",
+            range=[float(frame["strike"].min()), float(frame["strike"].max())],
+            gridcolor="#1b2735",
+        ),
+        title=f"{symbol} / DEALER GAMMA BY STRIKE",
+    )
     st.plotly_chart(chart, use_container_width=True, config={"displayModeBar": False})
 
 
@@ -202,7 +241,11 @@ def main() -> None:
     display.columns = ["Strike", "Call GEX", "Net GEX", "Put GEX"]
     styled_display = display.style.format(
         {"Strike": "${:.2f}", "Call GEX": money, "Net GEX": money, "Put GEX": money}
-    ).apply(style_net_gex, subset=["Net GEX"])
+    ).set_properties(
+        **{"background-color": "#111a24", "color": "#dce5ef", "border-color": "#243140"}
+    ).set_table_styles([
+        {"selector": "th", "props": [("background-color", "#0b121b"), ("color", "#8796a8"), ("border-color", "#243140")]},
+    ]).apply(style_net_gex, subset=["Net GEX"])
     st.dataframe(styled_display, use_container_width=True, hide_index=True, height=390)
 
 
