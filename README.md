@@ -2,6 +2,14 @@
 
 Standalone Streamlit dashboard for public options-chain data. It shows dealer gamma exposure by strike, net gamma regime, gamma flip, call wall, put wall, and max-pain positioning.
 
+## Version 1.1
+
+- Reference-style two-sided call/put gamma chart with centered zero line
+- Readable Max Pain node, guide, highlighted row, and summary card
+- Focused strike matrix with right-aligned GEX columns
+- Yahoo-derived ATM IV, expected move, Volt, and Delta Grower cards
+- Negative gamma is red; positive gamma is green
+
 ## Run locally
 
 ```powershell

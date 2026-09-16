@@ -11,6 +11,8 @@ import streamlit as st
 import yfinance as yf
 from scipy.stats import norm
 
+APP_VERSION = "Version 1.1"
+
 st.set_page_config(page_title="Gamma Surface", page_icon="◈", layout="wide")
 
 
@@ -303,7 +305,7 @@ def main() -> None:
     .summary-card-note { color:#8796a8; font:400 .61rem 'DM Mono',monospace; margin-top:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
     </style>
     """, unsafe_allow_html=True)
-    st.sidebar.markdown("<div class='terminal-label'>GAMMA SURFACE / PUBLIC DATA</div>", unsafe_allow_html=True)
+    st.sidebar.markdown(f"<div class='terminal-label'>GAMMA SURFACE / PUBLIC DATA · {APP_VERSION.upper()}</div>", unsafe_allow_html=True)
     symbol = st.sidebar.text_input("Symbol", "SPY", max_chars=8).strip().upper()
     st.sidebar.caption("Yahoo Finance · delayed market data")
     refresh = st.sidebar.button("Refresh data", use_container_width=True, type="primary")
