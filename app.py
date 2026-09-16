@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
+from html import escape
 from typing import Any
 
 import numpy as np
@@ -94,7 +95,10 @@ def build_gex_frame(calls: pd.DataFrame, puts: pd.DataFrame, spot: float, expira
         on="strike",
         how="outer",
     ).fillna(0)
-    frame = frame[(frame["strike"] >= spot * 0.90) & (frame["strike"] <= spot * 1.10)].sort_values("strike")
+    frame = frame[(frame["strike"] >= spot * 0.96) & (frame["strike"] <= spot * 1.04)]
+    if len(frame) > 41:
+        frame = frame.loc[(frame["strike"] - spot).abs().nsmallest(41).index]
+    frame = frame.sort_values("strike")
     frame["Net_GEX"] = frame["Call_GEX"] + frame["Put_GEX"]
     return frame.reset_index(drop=True)
 
@@ -140,6 +144,46 @@ def style_net_gex(values: pd.Series) -> list[str]:
     return styles
 
 
+def style_matrix_rows(row: pd.Series, spot_strike: float, levels: dict[str, float | str]) -> list[str]:
+    strike = float(row["Strike"])
+    styles = ["" for _ in row]
+    if abs(strike - float(levels["max_pain"])) < 0.01:
+        styles = ["background-color: rgba(245, 200, 75, 0.22); color: #f5c84b; font-weight: 600" for _ in row]
+    if abs(strike - spot_strike) < 0.01:
+        styles = ["background-color: rgba(245, 200, 75, 0.10); color: #f5c84b; font-weight: 600" for _ in row]
+    return styles
+
+
+def render_matrix(frame: pd.DataFrame, spot: float, levels: dict[str, float | str]) -> None:
+    max_net = max(float(frame["Net_GEX"].abs().max()), 1.0)
+    spot_strike = float(frame.loc[(frame["strike"] - spot).abs().idxmin(), "strike"])
+    rows = []
+    for _, row in frame.iterrows():
+        strike = float(row["strike"])
+        is_max_pain = abs(strike - float(levels["max_pain"])) < 0.01
+        is_spot = abs(strike - spot_strike) < 0.01
+        row_class = " gold-row" if is_max_pain else " spot-row" if is_spot else ""
+        net = float(row["Net_GEX"])
+        net_width = min(abs(net) / max_net * 100, 100)
+        net_color = "#28d7a1" if net >= 0 else "#ff557d"
+        marker = " ◆ MAX PAIN" if is_max_pain else " ◈ SPOT" if is_spot else ""
+        rows.append(
+            f"<div class='matrix-row{row_class}'>"
+            f"<div class='strike-cell'>{strike:.0f}<span class='row-marker'>{escape(marker)}</span></div>"
+            f"<div class='value-cell call-value'>{money(float(row['Call_GEX']))}</div>"
+            f"<div class='net-cell'><span class='net-bar' style='width:{net_width:.1f}%;background:{net_color}'></span><span>{money(net)}</span></div>"
+            f"<div class='value-cell put-value'>{money(float(row['Put_GEX']))}</div>"
+            "</div>"
+        )
+    st.markdown(
+        "<div class='matrix'>"
+        "<div class='matrix-head'><div>STRIKE</div><div>CALL GEX</div><div>NET GEX</div><div>PUT GEX</div></div>"
+        + "".join(rows)
+        + "</div>",
+        unsafe_allow_html=True,
+    )
+
+
 def render_chart(frame: pd.DataFrame, spot: float, levels: dict[str, float | str], symbol: str) -> None:
     max_exposure = max(
         float(frame[["Call_GEX", "Put_GEX"]].abs().to_numpy().max()) / 1_000_000,
@@ -162,10 +206,21 @@ def render_chart(frame: pd.DataFrame, spot: float, levels: dict[str, float | str
         marker_color="#28d7a1",
         hovertemplate="Strike %{y:.2f}<br>Call GEX $%{x:.2f}M<extra></extra>",
     ))
+    chart.add_trace(go.Scatter(
+        x=[0],
+        y=[float(levels["max_pain"])],
+        mode="markers+text",
+        marker=dict(symbol="diamond", size=12, color="#f5c84b", line=dict(color="#fff1a6", width=1)),
+        text=[f"MAX PAIN ${float(levels['max_pain']):.2f}"],
+        textposition="middle right",
+        textfont=dict(color="#f5c84b", size=10),
+        name="Max pain",
+        hovertemplate="Max pain %{y:.2f}<extra></extra>",
+    ))
     chart.add_vline(x=0, line_color="#5e6b7d", line_width=1)
-    chart.add_hline(y=spot, line_color="#f5c84b", line_width=2, annotation_text=f"SPOT ${spot:.2f}", annotation_position="top left")
+    chart.add_hline(y=spot, line_color="#f5c84b", line_width=2, annotation_text=f"SPOT ${spot:.2f}", annotation_position="top left", annotation_font_color="#f5c84b")
     for key, color in (("call_wall", "#28d7a1"), ("put_wall", "#ff557d"), ("gamma_flip", "#aa7cff")):
-        chart.add_hline(y=float(levels[key]), line_color=color, line_dash="dot", line_width=1, annotation_text=key.replace("_", " ").upper(), annotation_font_color=color)
+        chart.add_hline(y=float(levels[key]), line_color=color, line_dash="dot", line_width=1, annotation_text=f"{key.replace('_', ' ').upper()} ${float(levels[key]):.2f}", annotation_font_color=color, annotation_position="top right")
     chart.update_layout(
         height=570,
         template="plotly_dark",
@@ -184,6 +239,7 @@ def render_chart(frame: pd.DataFrame, spot: float, levels: dict[str, float | str
             title="Strike",
             range=[float(frame["strike"].min()), float(frame["strike"].max())],
             gridcolor="#1b2735",
+            dtick=max(float(frame["strike"].max() - frame["strike"].min()) / 12, 1),
         ),
         title=f"{symbol} / DEALER GAMMA BY STRIKE",
     )
@@ -204,6 +260,24 @@ def main() -> None:
     section[data-testid='stSidebar'] { background:#0b121b; border-right:1px solid #243140; }
     .terminal-label { color:#8796a8; font:500 .7rem 'DM Mono',monospace; letter-spacing:.14em; text-transform:uppercase; }
     .regime { border-left:3px solid #28d7a1; background:#101b25; padding:12px 16px; margin:4px 0 18px; color:#28d7a1; font:500 .78rem 'DM Mono',monospace; letter-spacing:.08em; }
+    .summary-value { color:#f5c84b; font:600 1.1rem 'DM Mono',monospace; }
+    .summary-note { color:#8796a8; font:400 .7rem 'DM Mono',monospace; }
+    [data-testid='stMarkdownContainer'] .summary-value { line-height:1.8; }
+    .matrix { border:1px solid #243140; border-radius:6px; overflow:hidden; background:#0d151f; font:400 .72rem 'DM Mono',monospace; }
+    .matrix-head, .matrix-row { display:grid; grid-template-columns: 1fr 1.2fr 1.6fr 1.2fr; align-items:center; min-height:32px; border-bottom:1px solid #1c2937; }
+    .matrix-head { background:#162231; color:#8796a8; font-size:.64rem; letter-spacing:.1em; }
+    .matrix-head > div, .matrix-row > div { padding:7px 12px; }
+    .matrix-row { color:#dce5ef; }
+    .matrix-row:hover { background:#182533; }
+    .strike-cell { color:#dce5ef; font-weight:600; }
+    .call-value { color:#57e4b4; text-align:right; }
+    .put-value { color:#ff7797; text-align:right; }
+    .net-cell { position:relative; display:flex; justify-content:flex-end; overflow:hidden; }
+    .net-cell > span:last-child { position:relative; z-index:1; }
+    .net-bar { position:absolute; right:0; top:3px; bottom:3px; opacity:.32; border-radius:2px; }
+    .row-marker { color:#f5c84b; font-size:.58rem; margin-left:8px; }
+    .gold-row { background:rgba(245,200,75,.13); box-shadow:inset 3px 0 #f5c84b; }
+    .spot-row { background:rgba(245,200,75,.06); box-shadow:inset 3px 0 #8c7430; }
     </style>
     """, unsafe_allow_html=True)
     st.sidebar.markdown("<div class='terminal-label'>GAMMA SURFACE / PUBLIC DATA</div>", unsafe_allow_html=True)
@@ -220,7 +294,9 @@ def main() -> None:
     if market_error:
         st.error(market_error)
         return
-    expiration = st.sidebar.selectbox("Expiration", expirations, index=0, format_func=lambda value: f"{value}  ·  {(date.fromisoformat(value) - date.today()).days}D")
+    today_expiration = date.today().isoformat()
+    default_expiration = expirations.index(today_expiration) if today_expiration in expirations else 0
+    expiration = st.sidebar.selectbox("Expiration", expirations, index=default_expiration, format_func=lambda value: f"{value}  ·  {(date.fromisoformat(value) - date.today()).days}D")
     calls, puts, chain_error = load_chain(symbol, expiration)
     if chain_error or spot is None:
         st.error(chain_error or "No spot price available.")
@@ -237,16 +313,12 @@ def main() -> None:
     metrics[4].metric("Put wall", f"${float(levels['put_wall']):.2f}")
     render_chart(frame, spot, levels, symbol)
     st.subheader("Strike matrix")
-    display = frame[["strike", "Call_GEX", "Net_GEX", "Put_GEX"]].copy()
-    display.columns = ["Strike", "Call GEX", "Net GEX", "Put GEX"]
-    styled_display = display.style.format(
-        {"Strike": "${:.2f}", "Call GEX": money, "Net GEX": money, "Put GEX": money}
-    ).set_properties(
-        **{"background-color": "#111a24", "color": "#dce5ef", "border-color": "#243140"}
-    ).set_table_styles([
-        {"selector": "th", "props": [("background-color", "#0b121b"), ("color", "#8796a8"), ("border-color", "#243140")]},
-    ]).apply(style_net_gex, subset=["Net GEX"])
-    st.dataframe(styled_display, use_container_width=True, hide_index=True, height=390)
+    render_matrix(frame, spot, levels)
+    summary = st.columns(4)
+    summary[0].markdown(f"**NET GEX · {expiration}**\n\n<span class='summary-value'>{money(total)}</span>\n\n<span class='summary-note'>{levels['regime']}</span>", unsafe_allow_html=True)
+    summary[1].markdown(f"**CALL WALL · {expiration}**\n\n<span class='summary-value'>${float(levels['call_wall']):.2f}</span>\n\n<span class='summary-note'>{float(levels['call_wall']) - spot:+.2f} from spot</span>", unsafe_allow_html=True)
+    summary[2].markdown(f"**MAX PAIN · {expiration}**\n\n<span class='summary-value'>${float(levels['max_pain']):.2f}</span>\n\n<span class='summary-note'>{float(levels['max_pain']) - spot:+.2f} from spot</span>", unsafe_allow_html=True)
+    summary[3].markdown(f"**GAMMA FLIP · {expiration}**\n\n<span class='summary-value'>{float(levels['gamma_flip']):.2f}</span>\n\n<span class='summary-note'>{float(levels['gamma_flip']) - spot:+.2f} from spot</span>", unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
