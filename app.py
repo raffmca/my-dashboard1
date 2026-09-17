@@ -18,6 +18,8 @@ S_AND_P_50 = (
     "COST JNJ HD PG BAC ABBV CVX KO MRK AMD PEP TMO CRM ACN MCD WFC LIN CSCO IBM " \
     "ABT GE NOW INTU ISRG QCOM TXN AMGN CAT PLTR DIS DHR VZ CMCSA PFE NEE".split()
 )
+TODAY_UNIVERSE = ("QQQ", "SPY", "IWM", "SPXW")
+YAHOO_SYMBOLS = {"SPXW": "^SPX"}
 
 st.set_page_config(page_title="Gamma Surface", page_icon="◈", layout="wide")
 
@@ -101,14 +103,10 @@ def load_chain(symbol: str, expiration: str) -> tuple[pd.DataFrame, pd.DataFrame
     return calls, puts, None
 
 
-def _next_friday() -> str:
-    days_ahead = (4 - date.today().weekday()) % 7
-    return (date.today() + pd.Timedelta(days=days_ahead)).isoformat()
-
-
 def _scan_ticker(symbol: str, expiration: str) -> dict[str, Any] | None:
     try:
-        ticker = yf.Ticker(symbol)
+        yahoo_symbol = YAHOO_SYMBOLS.get(symbol, symbol)
+        ticker = yf.Ticker(yahoo_symbol)
         if expiration not in list(ticker.options or []):
             return None
         info = ticker.fast_info
@@ -134,10 +132,10 @@ def _scan_ticker(symbol: str, expiration: str) -> dict[str, Any] | None:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def scan_optionable_universe(expiration: str) -> pd.DataFrame:
+def scan_optionable_universe(expiration: str, symbols: tuple[str, ...]) -> pd.DataFrame:
     records: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = [executor.submit(_scan_ticker, symbol, expiration) for symbol in S_AND_P_50]
+        futures = [executor.submit(_scan_ticker, symbol, expiration) for symbol in symbols]
         for future in as_completed(futures):
             record = future.result()
             if record:
@@ -153,10 +151,10 @@ def scan_optionable_universe(expiration: str) -> pd.DataFrame:
     return result.sort_values(["Tradeability", "Dollar volume"], ascending=False).head(20).reset_index(drop=True)
 
 
-def render_universe_scan(expiration: str) -> None:
+def render_universe_scan(expiration: str, symbols: tuple[str, ...]) -> None:
     st.markdown(f"<div class='layer-title'>TOP 20 0DTE UNIVERSE <span>{expiration} · RANKED BY OPTION LIQUIDITY</span></div>", unsafe_allow_html=True)
     with st.spinner(f"Scanning optionable universe for {expiration}..."):
-        ranked = scan_optionable_universe(expiration)
+        ranked = scan_optionable_universe(expiration, symbols)
     if ranked.empty:
         st.warning(f"Yahoo returned no option chains for {expiration}.")
         return
@@ -164,6 +162,85 @@ def render_universe_scan(expiration: str) -> None:
     display["Dollar volume"] = display["Dollar volume"] / 1_000_000
     display.columns = ["Ticker", "Spot", "Opt vol", "$ opt vol (M)", "OI", "Spread %", "Score"]
     st.dataframe(display.style.format({"Spot": "${:.2f}", "$ opt vol (M)": "${:.1f}", "Spread %": "{:.2f}%", "Score": "{:.0f}"}), use_container_width=True, hide_index=True, height=520)
+
+
+def _next_friday() -> str:
+    days_ahead = (4 - date.today().weekday()) % 7
+    return (date.today() + pd.Timedelta(days=days_ahead)).isoformat()
+
+
+def evaluate_actionable_signal(symbol: str, expiration: str) -> dict[str, Any] | None:
+    yahoo_symbol = YAHOO_SYMBOLS.get(symbol, symbol)
+    spot, expirations, error = load_market_data(yahoo_symbol)
+    if error or spot is None or expiration not in expirations:
+        return None
+    calls, puts, error = load_chain(yahoo_symbol, expiration)
+    if error:
+        return None
+    full_frame = build_gex_frame(calls, puts, spot, expiration)
+    if full_frame.empty:
+        return None
+    levels = find_levels(full_frame, spot)
+    history = load_price_history(yahoo_symbol, "3mo")
+    if history.empty:
+        return None
+    volume = history["Volume"]
+    avg_volume = float(volume.rolling(20).mean().iloc[-1]) if len(volume) >= 20 else 0.0
+    relative_volume = float(volume.iloc[-1] / avg_volume) if avg_volume else 0.0
+    atr = float((history["High"] - history["Low"]).rolling(14).mean().iloc[-1]) if len(history) >= 14 else 0.0
+    total_gex = float(full_frame["Net_GEX"].sum())
+    call_wall = float(levels["call_wall"])
+    put_wall = float(levels["put_wall"])
+    gamma_flip = float(levels["gamma_flip"])
+    wall_range = max(call_wall - put_wall, 0.01)
+    wall_position = (spot - put_wall) / wall_range
+    above_flip = spot > gamma_flip
+    breakout_up = spot > call_wall and above_flip and relative_volume >= 1.2
+    breakdown_down = spot < put_wall and not above_flip and relative_volume >= 1.2
+    if total_gex < 0 and breakout_up:
+        setup = "LONG BREAKOUT"
+        reasons = ["Negative GEX can amplify movement", "Spot is above Gamma Flip and Call Wall", f"Relative volume is {relative_volume:.1f}x normal"]
+        trigger = f"Hold above ${call_wall:.2f}"
+        invalidation = f"Close back below ${call_wall:.2f}"
+        target = "Upper expected-move band / next resistance"
+    elif total_gex < 0 and breakdown_down:
+        setup = "SHORT BREAKDOWN"
+        reasons = ["Negative GEX can amplify movement", "Spot is below Gamma Flip and Put Wall", f"Relative volume is {relative_volume:.1f}x normal"]
+        trigger = f"Hold below ${put_wall:.2f}"
+        invalidation = f"Close back above ${put_wall:.2f}"
+        target = "Lower expected-move band / next support"
+    elif total_gex > 0 and 0.15 <= wall_position <= 0.85:
+        setup = "RANGE / FADE"
+        reasons = ["Positive GEX favors mean reversion", f"Spot is {wall_position:.0%} through the wall range", "No confirmed wall breakout"]
+        trigger = f"Rejection near ${put_wall:.2f} or ${call_wall:.2f}"
+        invalidation = "15-minute close beyond the tested wall"
+        target = "VWAP / wall-range midpoint"
+    else:
+        setup = "WAIT"
+        reasons = ["Price location and dealer regime are not aligned", f"GEX regime is {'positive' if total_gex >= 0 else 'negative'}", f"Relative volume is {relative_volume:.1f}x normal"]
+        trigger = "Wait for wall acceptance or rejection"
+        invalidation = "No trade without confirmation"
+        target = "Next confirmed level"
+    return {"Ticker": symbol, "Setup": setup, "Spot": spot, "GEX": total_gex, "Gamma Flip": gamma_flip, "Put Wall": put_wall, "Call Wall": call_wall, "Rel Vol": relative_volume, "ATR": atr, "Why": reasons, "Trigger": trigger, "Invalidation": invalidation, "Target": target}
+
+
+def render_actionable_signals(expiration: str, symbols: tuple[str, ...]) -> None:
+    st.markdown(f"<div class='layer-title'>ACTIONABLE SIGNAL BOARD <span>{expiration} · EXPLICIT THESIS · NOT INVESTMENT ADVICE</span></div>", unsafe_allow_html=True)
+    signals = []
+    with st.spinner(f"Building directional signals for {len(symbols)} tickers..."):
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(evaluate_actionable_signal, symbol, expiration) for symbol in symbols]
+            for future in as_completed(futures):
+                signal = future.result()
+                if signal:
+                    signals.append(signal)
+    if not signals:
+        st.warning(f"No complete Yahoo chain was available for {expiration}.")
+        return
+    for signal in sorted(signals, key=lambda item: (item["Setup"] == "WAIT", -abs(item["GEX"]))):
+        setup_class = "signal-red" if "SHORT" in signal["Setup"] or signal["Setup"] == "WAIT" else "signal-green" if "LONG" in signal["Setup"] else "signal-gold"
+        reasons = "<br>".join(f"· {escape(reason)}" for reason in signal["Why"])
+        st.markdown(f"<div class='signal-card {setup_class}'><div class='signal-top'><b>{signal['Ticker']}</b><strong>{signal['Setup']}</strong><span>${signal['Spot']:.2f} · GEX {money(signal['GEX'])}</span></div><div class='signal-grid'><div><label>WHY</label><p>{reasons}</p></div><div><label>TRIGGER</label><p>{escape(signal['Trigger'])}</p></div><div><label>INVALIDATION</label><p>{escape(signal['Invalidation'])}</p></div><div><label>TARGET</label><p>{escape(signal['Target'])}</p></div></div><div class='signal-meta'>FLIP ${signal['Gamma Flip']:.2f} · PUT WALL ${signal['Put Wall']:.2f} · CALL WALL ${signal['Call Wall']:.2f} · REL VOL {signal['Rel Vol']:.1f}x · ATR ${signal['ATR']:.2f}</div></div>", unsafe_allow_html=True)
 
 
 def calculate_gamma(spot: float, strike: pd.Series, days_to_expiry: int, volatility: pd.Series) -> pd.Series:
@@ -446,8 +523,7 @@ def render_chart(frame: pd.DataFrame, spot: float, levels: dict[str, float | str
     st.plotly_chart(chart, use_container_width=True, config={"displayModeBar": False})
 
 
-def main() -> None:
-    authenticate()
+def render_terminal() -> None:
     st.markdown("""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Space+Grotesk:wght@500;600;700&display=swap');
@@ -507,27 +583,6 @@ def main() -> None:
     symbol = st.sidebar.text_input("Symbol", "SPY", max_chars=8).strip().upper()
     st.sidebar.caption("Yahoo Finance · delayed market data")
     refresh = st.sidebar.button("Refresh data", use_container_width=True, type="primary")
-    if "show_layers" not in st.session_state:
-        st.session_state.show_layers = False
-    if st.sidebar.button(
-        "Hide institutional layers" if st.session_state.show_layers else "Add institutional layers",
-        use_container_width=True,
-    ):
-        st.session_state.show_layers = not st.session_state.show_layers
-    if "show_universe" not in st.session_state:
-        st.session_state.show_universe = False
-    if st.sidebar.button(
-        "Hide top-20 scanner" if st.session_state.show_universe else "Scan top 20 optionable",
-        use_container_width=True,
-    ):
-        st.session_state.show_universe = not st.session_state.show_universe
-    scanner_expiries = [date.today().isoformat(), _next_friday()]
-    scanner_expiry = st.sidebar.selectbox(
-        "Universe expiry",
-        scanner_expiries,
-        format_func=lambda value: f"{value} · {'TODAY' if value == date.today().isoformat() else 'FRIDAY'}",
-        disabled=not st.session_state.show_universe,
-    )
     if refresh:
         load_market_data.clear()
         load_chain.clear()
@@ -587,15 +642,39 @@ def main() -> None:
         "</div>",
         unsafe_allow_html=True,
     )
-    if st.session_state.show_universe:
-        render_universe_scan(scanner_expiry)
-    if st.session_state.show_layers:
-        try:
-            history = load_price_history(symbol)
-            layers = calculate_institutional_layers(calls, puts, spot, expiration, history)
-            render_institutional_layers(layers, spot)
-        except Exception as exc:
-            st.warning(f"Institutional layers unavailable: {exc}")
+def render_institutional_tab() -> None:
+    symbol = st.selectbox("Institutional ticker", ["SPY", "QQQ", "IWM", "AAPL", "NVDA"], key="institutional_symbol")
+    spot, expirations, error = load_market_data(symbol)
+    if error or spot is None:
+        st.warning(error or "No price data available.")
+        return
+    expiration = st.selectbox("Institutional expiry", expirations[:10], key="institutional_expiry")
+    calls, puts, error = load_chain(symbol, expiration)
+    if error:
+        st.warning(error)
+        return
+    try:
+        layers = calculate_institutional_layers(calls, puts, spot, expiration, load_price_history(symbol))
+        render_institutional_layers(layers, spot)
+    except Exception as exc:
+        st.warning(f"Institutional layers unavailable: {exc}")
+
+
+def main() -> None:
+    authenticate()
+    tabs = st.tabs(["Terminal", "Actionable signals", "Institutional layers"])
+    with tabs[0]:
+        render_terminal()
+    with tabs[1]:
+        st.markdown("<div class='terminal-label'>DIRECTIONAL PLAYBOOKS · EXACT EXPIRY UNIVERSE</div>", unsafe_allow_html=True)
+        today = date.today().isoformat()
+        friday = _next_friday()
+        signal_expiry = st.radio("Signal expiry", [today, friday], format_func=lambda value: f"{value} · {'TODAY' if value == today else 'FRIDAY'}", horizontal=True)
+        signal_universe = TODAY_UNIVERSE if signal_expiry == today else tuple(S_AND_P_50)
+        render_actionable_signals(signal_expiry, signal_universe)
+        render_universe_scan(signal_expiry, signal_universe)
+    with tabs[2]:
+        render_institutional_tab()
 
 
 if __name__ == "__main__":

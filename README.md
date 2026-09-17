@@ -20,6 +20,10 @@ Standalone Streamlit dashboard for public options-chain data. It shows dealer ga
 
 Use **Scan top 20 optionable** in the sidebar to rank the liquid S&P universe by near-term option dollar volume, open interest, and bid/ask quality. The scanner supports exact `TODAY` and `FRIDAY` expirations. Yahoo may not publish an exact same-day chain for every symbol; those symbols are skipped instead of being replaced with a different expiry.
 
+## Actionable signal board
+
+The **Actionable signals** tab turns the levels into a conditional playbook rather than a score: `LONG BREAKOUT`, `SHORT BREAKDOWN`, `RANGE / FADE`, or `WAIT`. Each result includes the reasons, trigger, invalidation, target, Gamma Flip, walls, relative volume, and ATR. Today uses `QQQ`, `SPY`, `IWM`, and Yahoo's `^SPX` mapping for `SPXW`; Friday uses the broader S&P optionable universe.
+
 ## Run locally
 
 ```powershell
