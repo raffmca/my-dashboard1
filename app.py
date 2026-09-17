@@ -275,11 +275,19 @@ def build_gex_frame(calls: pd.DataFrame, puts: pd.DataFrame, spot: float, expira
     return frame.reset_index(drop=True)
 
 
-def focus_strikes(frame: pd.DataFrame, spot: float) -> pd.DataFrame:
-    frame = frame[(frame["strike"] >= spot * 0.96) & (frame["strike"] <= spot * 1.04)]
+def focus_strikes(
+    frame: pd.DataFrame,
+    spot: float,
+    required_strikes: list[float] | None = None,
+) -> pd.DataFrame:
+    frame = frame.copy()
     if len(frame) > 41:
-        frame = frame.loc[(frame["strike"] - spot).abs().nsmallest(41).index]
-    return frame.reset_index(drop=True)
+        nearest = set((frame["strike"] - spot).abs().nsmallest(41).index)
+        required = set()
+        for required_strike in required_strikes or []:
+            required.add((frame["strike"] - required_strike).abs().idxmin())
+        frame = frame.loc[sorted(nearest | required)]
+    return frame.sort_values("strike").reset_index(drop=True)
 
 
 def find_levels(frame: pd.DataFrame, spot: float) -> dict[str, float | str]:
@@ -328,6 +336,10 @@ def money(value: float) -> str:
     return f"{sign}${amount:.0f}"
 
 
+def money_or_dash(value: float) -> str:
+    return "—" if abs(value) < 0.5 else money(value)
+
+
 def style_net_gex(values: pd.Series) -> list[str]:
     max_abs = max(float(values.abs().max()), 1.0)
     styles = []
@@ -366,9 +378,9 @@ def render_matrix(frame: pd.DataFrame, spot: float, levels: dict[str, float | st
         rows.append(
             f"<div class='matrix-row{row_class}'>"
             f"<div class='strike-cell'>{strike:.0f}<span class='row-marker'>{escape(marker)}</span></div>"
-            f"<div class='value-cell call-value'>{money(float(row['Call_GEX']))}</div>"
-            f"<div class='net-cell'><span class='net-bar' style='width:{net_width:.1f}%;background:{net_color}'></span><span>{money(net)}</span></div>"
-            f"<div class='value-cell put-value'>{money(float(row['Put_GEX']))}</div>"
+            f"<div class='value-cell call-value'>{money_or_dash(float(row['Call_GEX']))}</div>"
+            f"<div class='net-cell'><span class='net-bar' style='width:{net_width:.1f}%;background:{net_color}'></span><span>{money_or_dash(net)}</span></div>"
+            f"<div class='value-cell put-value'>{money_or_dash(float(row['Put_GEX']))}</div>"
             "</div>"
         )
     st.markdown(
@@ -505,6 +517,7 @@ def render_chart(frame: pd.DataFrame, spot: float, levels: dict[str, float | str
     )
     for key, color in (("call_wall", "#28d7a1"), ("put_wall", "#ff557d"), ("gamma_flip", "#aa7cff")):
         chart.add_hline(y=float(levels[key]), line_color=color, line_dash="dot", line_width=1, annotation_text=f"{key.replace('_', ' ').upper()} ${float(levels[key]):.2f}", annotation_font_color=color, annotation_position="top right")
+    y_tick_step = 2 if spot < 300 else 5 if spot < 1000 else 10
     chart.update_layout(
         height=570,
         template="plotly_dark",
@@ -521,9 +534,12 @@ def render_chart(frame: pd.DataFrame, spot: float, levels: dict[str, float | str
         ),
         yaxis=dict(
             title="Strike",
-            range=[float(frame["strike"].min()), float(frame["strike"].max())],
+            range=[
+                min(float(frame["strike"].min()), float(levels["max_pain"])),
+                max(float(frame["strike"].max()), float(levels["max_pain"])),
+            ],
             gridcolor="#1b2735",
-            dtick=max(float(frame["strike"].max() - frame["strike"].min()) / 12, 1),
+            dtick=y_tick_step,
         ),
         title=f"{symbol} / DEALER GAMMA BY STRIKE",
     )
@@ -627,8 +643,8 @@ def render_terminal() -> None:
         st.error(chain_error or "No spot price available.")
         return
     full_frame = build_gex_frame(calls, puts, spot, expiration)
-    frame = focus_strikes(full_frame, spot)
     levels = find_levels(full_frame, spot)
+    frame = focus_strikes(full_frame, spot, [float(levels["max_pain"])])
     total = float(frame["Net_GEX"].sum())
     days_to_expiry = max((date.fromisoformat(expiration) - date.today()).days, 1)
     spot_strike = float(frame.loc[(frame["strike"] - spot).abs().idxmin(), "strike"])
