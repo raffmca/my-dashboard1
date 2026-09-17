@@ -155,18 +155,13 @@ def render_universe_scan(expiration: str, symbols: tuple[str, ...]) -> None:
     st.markdown(f"<div class='layer-title'>TOP 20 0DTE UNIVERSE <span>{expiration} · RANKED BY OPTION LIQUIDITY</span></div>", unsafe_allow_html=True)
     with st.spinner(f"Scanning optionable universe for {expiration}..."):
         ranked = scan_optionable_universe(expiration, symbols)
-    if ranked.empty:
+    if ranked.empty or not symbols:
         st.warning(f"Yahoo returned no option chains for {expiration}.")
         return
     display = ranked[["Ticker", "Spot", "Option volume", "Dollar volume", "Open interest", "Spread %", "Tradeability"]].copy()
     display["Dollar volume"] = display["Dollar volume"] / 1_000_000
     display.columns = ["Ticker", "Spot", "Opt vol", "$ opt vol (M)", "OI", "Spread %", "Score"]
     st.dataframe(display.style.format({"Spot": "${:.2f}", "$ opt vol (M)": "${:.1f}", "Spread %": "{:.2f}%", "Score": "{:.0f}"}), use_container_width=True, hide_index=True, height=520)
-
-
-def _next_friday() -> str:
-    days_ahead = (4 - date.today().weekday()) % 7
-    return (date.today() + pd.Timedelta(days=days_ahead)).isoformat()
 
 
 def evaluate_actionable_signal(symbol: str, expiration: str) -> dict[str, Any] | None:
@@ -575,6 +570,25 @@ def render_terminal() -> None:
     .layer-value.layer-negative { color:#ff557d; }
     .layer-value.layer-positive { color:#28d7a1; }
     .layer-note { color:#8796a8; font:400 .62rem 'DM Mono',monospace; margin-top:5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .signal-card { margin:10px 0; border:1px solid #243140; border-left:4px solid #f5c84b; border-radius:6px; background:#111a24; padding:14px 16px; }
+    .signal-card.signal-green { border-color:#1d765d; border-left-color:#28d7a1; background:linear-gradient(90deg, rgba(40,215,161,.13), #111a24 42%); }
+    .signal-card.signal-red { border-color:#783049; border-left-color:#ff557d; background:linear-gradient(90deg, rgba(255,85,125,.13), #111a24 42%); }
+    .signal-card.signal-gold { border-left-color:#f5c84b; background:linear-gradient(90deg, rgba(245,200,75,.10), #111a24 42%); }
+    .signal-top { display:grid; grid-template-columns:90px 1fr auto; gap:12px; align-items:center; color:#dce5ef; font:500 .82rem 'DM Mono',monospace; }
+    .signal-top b { color:#f5c84b; font-size:1rem; }
+    .signal-top strong { color:#28d7a1; letter-spacing:.05em; }
+    .signal-red .signal-top strong { color:#ff557d; }
+    .signal-gold .signal-top strong { color:#f5c84b; }
+    .signal-top span { color:#8796a8; text-align:right; }
+    .signal-grid { display:grid; grid-template-columns:2fr 1.2fr 1.2fr 1.2fr; gap:14px; margin-top:13px; }
+    .signal-grid label { color:#8796a8; font:500 .61rem 'DM Mono',monospace; letter-spacing:.1em; }
+    .signal-grid p { color:#dce5ef; font:400 .7rem 'DM Mono',monospace; line-height:1.65; margin:6px 0 0; }
+    .signal-meta { border-top:1px solid #243140; color:#8796a8; font:400 .62rem 'DM Mono',monospace; margin-top:12px; padding-top:9px; }
+    .signal-date-label { color:#f5c84b; font:500 .72rem 'DM Mono',monospace; letter-spacing:.08em; }
+    [data-testid='stRadio'] label { color:#f5c84b !important; font:500 .72rem 'DM Mono',monospace !important; }
+    [data-testid='stRadio'] label p { color:#f5c84b !important; }
+    [data-testid='stTabs'] button { color:#8796a8 !important; font-family:'DM Mono',monospace !important; }
+    [data-testid='stTabs'] button[aria-selected='true'] { color:#f5c84b !important; }
     @media (max-width: 900px) { .layer-grid { grid-template-columns:repeat(2, minmax(160px, 1fr)); } }
     @media (max-width: 560px) { .layer-grid { grid-template-columns:1fr; } }
     </style>
