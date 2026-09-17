@@ -17,9 +17,10 @@ st.set_page_config(page_title="Gamma Surface", page_icon="◈", layout="wide")
 
 
 def authenticate() -> None:
-    configured_password = st.secrets.get("dashboard_password", "")
+    configured_password = st.secrets.get("dashboard_password")
     if not configured_password:
-        return
+        st.error("Dashboard is not configured. Set the dashboard_password secret before running this app.")
+        st.stop()
     if st.session_state.get("authenticated", False):
         return
     st.title("Gamma Surface")
@@ -114,11 +115,15 @@ def build_gex_frame(calls: pd.DataFrame, puts: pd.DataFrame, spot: float, expira
         on="strike",
         how="outer",
     ).fillna(0)
+    frame = frame.sort_values("strike")
+    frame["Net_GEX"] = frame["Call_GEX"] + frame["Put_GEX"]
+    return frame.reset_index(drop=True)
+
+
+def focus_strikes(frame: pd.DataFrame, spot: float) -> pd.DataFrame:
     frame = frame[(frame["strike"] >= spot * 0.96) & (frame["strike"] <= spot * 1.04)]
     if len(frame) > 41:
         frame = frame.loc[(frame["strike"] - spot).abs().nsmallest(41).index]
-    frame = frame.sort_values("strike")
-    frame["Net_GEX"] = frame["Call_GEX"] + frame["Put_GEX"]
     return frame.reset_index(drop=True)
 
 
@@ -129,8 +134,25 @@ def find_levels(frame: pd.DataFrame, spot: float) -> dict[str, float | str]:
     call_wall = float(frame.loc[frame["Call_GEX"].idxmax(), "strike"])
     put_wall = float(frame.loc[frame["Put_GEX"].idxmin(), "strike"])
     pain = [np.sum(np.maximum(0, strikes - strike) * frame["Call_OI"] + np.maximum(0, strike - strikes) * frame["Put_OI"]) for strike in strikes]
-    changes = np.where(np.diff(np.sign(frame["Net_GEX"].to_numpy())) != 0)[0]
-    gamma_flip = float(frame.iloc[changes[0]]["strike"]) if len(changes) else spot
+    net_gex = frame["Net_GEX"].to_numpy()
+    changes = np.where(
+        ((net_gex[:-1] < 0) & (net_gex[1:] >= 0))
+        | ((net_gex[:-1] > 0) & (net_gex[1:] <= 0))
+    )[0]
+    if len(changes):
+        closest_change = min(
+            changes,
+            key=lambda index: min(
+                abs(float(frame.iloc[index]["strike"]) - spot),
+                abs(float(frame.iloc[index + 1]["strike"]) - spot),
+            ),
+        )
+        left = frame.iloc[closest_change]
+        right = frame.iloc[closest_change + 1]
+        net_delta = float(right["Net_GEX"] - left["Net_GEX"])
+        gamma_flip = float(left["strike"] - left["Net_GEX"] * (right["strike"] - left["strike"]) / net_delta) if net_delta else float(left["strike"])
+    else:
+        gamma_flip = spot
     total = float(frame["Net_GEX"].sum())
     return {
         "call_wall": call_wall,
@@ -438,8 +460,9 @@ def main() -> None:
     if chain_error or spot is None:
         st.error(chain_error or "No spot price available.")
         return
-    frame = build_gex_frame(calls, puts, spot, expiration)
-    levels = find_levels(frame, spot)
+    full_frame = build_gex_frame(calls, puts, spot, expiration)
+    frame = focus_strikes(full_frame, spot)
+    levels = find_levels(full_frame, spot)
     total = float(frame["Net_GEX"].sum())
     days_to_expiry = max((date.fromisoformat(expiration) - date.today()).days, 1)
     spot_strike = float(frame.loc[(frame["strike"] - spot).abs().idxmin(), "strike"])
