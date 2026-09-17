@@ -12,7 +12,7 @@ import streamlit as st
 import yfinance as yf
 from scipy.stats import norm
 
-APP_VERSION = "Version 1.2"
+APP_VERSION = "Version 2.0"
 S_AND_P_50 = (
     "AAPL MSFT NVDA AMZN META GOOGL AVGO TSLA BRK-B GOOG JPM WMT ORCL V LLY NFLX " \
     "COST JNJ HD PG BAC ABBV CVX KO MRK AMD PEP TMO CRM ACN MCD WFC LIN CSCO IBM " \
