@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date
 from html import escape
 from typing import Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -12,6 +13,11 @@ import yfinance as yf
 from scipy.stats import norm
 
 APP_VERSION = "Version 1.2"
+S_AND_P_50 = (
+    "AAPL MSFT NVDA AMZN META GOOGL AVGO TSLA BRK-B GOOG JPM WMT ORCL V LLY NFLX " \
+    "COST JNJ HD PG BAC ABBV CVX KO MRK AMD PEP TMO CRM ACN MCD WFC LIN CSCO IBM " \
+    "ABT GE NOW INTU ISRG QCOM TXN AMGN CAT PLTR DIS DHR VZ CMCSA PFE NEE".split()
+)
 
 st.set_page_config(page_title="Gamma Surface", page_icon="◈", layout="wide")
 
@@ -93,6 +99,71 @@ def load_chain(symbol: str, expiration: str) -> tuple[pd.DataFrame, pd.DataFrame
     calls = calls.dropna(subset=["strike"])
     puts = puts.dropna(subset=["strike"])
     return calls, puts, None
+
+
+def _next_friday() -> str:
+    days_ahead = (4 - date.today().weekday()) % 7
+    return (date.today() + pd.Timedelta(days=days_ahead)).isoformat()
+
+
+def _scan_ticker(symbol: str, expiration: str) -> dict[str, Any] | None:
+    try:
+        ticker = yf.Ticker(symbol)
+        if expiration not in list(ticker.options or []):
+            return None
+        info = ticker.fast_info
+        spot = _first_number([info.get("lastPrice"), info.get("regularMarketPrice")])
+        if spot is None:
+            return None
+        chain = ticker.option_chain(expiration)
+        options = pd.concat([chain.calls, chain.puts], ignore_index=True)
+        for column in ("volume", "openInterest", "bid", "ask"):
+            options[column] = pd.to_numeric(options.get(column, 0), errors="coerce").fillna(0)
+        options = options[options["strike"].between(spot * 0.95, spot * 1.05)]
+        if options.empty:
+            return None
+        active = options[options["volume"] > 0]
+        dollar_volume = float((active["volume"] * spot * 100).sum())
+        open_interest = int(options["openInterest"].sum())
+        spread_dollars = float((active["ask"] - active["bid"]).clip(lower=0).mean()) if not active.empty else 0.0
+        mid = ((active["ask"] + active["bid"]) / 2).replace(0, np.nan)
+        spread_percent = float(((active["ask"] - active["bid"]) / mid).replace([np.inf, -np.inf], np.nan).dropna().mean() * 100) if not active.empty else 0.0
+        return {"Ticker": symbol, "Spot": spot, "Option volume": int(active["volume"].sum()), "Dollar volume": dollar_volume, "Open interest": open_interest, "Avg spread": spread_dollars, "Spread %": spread_percent}
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def scan_optionable_universe(expiration: str) -> pd.DataFrame:
+    records: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(_scan_ticker, symbol, expiration) for symbol in S_AND_P_50]
+        for future in as_completed(futures):
+            record = future.result()
+            if record:
+                records.append(record)
+    if not records:
+        return pd.DataFrame()
+    result = pd.DataFrame(records)
+    result["volume_score"] = result["Dollar volume"].rank(pct=True) * 30
+    result["spread_score"] = (1 - result["Spread %"].rank(pct=True)) * 20
+    result["oi_score"] = result["Open interest"].rank(pct=True) * 15
+    result["underlying_score"] = result["Spot"].rank(pct=True) * 0
+    result["Tradeability"] = (result["volume_score"] + result["spread_score"] + result["oi_score"]).clip(0, 65)
+    return result.sort_values(["Tradeability", "Dollar volume"], ascending=False).head(20).reset_index(drop=True)
+
+
+def render_universe_scan(expiration: str) -> None:
+    st.markdown(f"<div class='layer-title'>TOP 20 0DTE UNIVERSE <span>{expiration} · RANKED BY OPTION LIQUIDITY</span></div>", unsafe_allow_html=True)
+    with st.spinner(f"Scanning optionable universe for {expiration}..."):
+        ranked = scan_optionable_universe(expiration)
+    if ranked.empty:
+        st.warning(f"Yahoo returned no option chains for {expiration}.")
+        return
+    display = ranked[["Ticker", "Spot", "Option volume", "Dollar volume", "Open interest", "Spread %", "Tradeability"]].copy()
+    display["Dollar volume"] = display["Dollar volume"] / 1_000_000
+    display.columns = ["Ticker", "Spot", "Opt vol", "$ opt vol (M)", "OI", "Spread %", "Score"]
+    st.dataframe(display.style.format({"Spot": "${:.2f}", "$ opt vol (M)": "${:.1f}", "Spread %": "{:.2f}%", "Score": "{:.0f}"}), use_container_width=True, hide_index=True, height=520)
 
 
 def calculate_gamma(spot: float, strike: pd.Series, days_to_expiry: int, volatility: pd.Series) -> pd.Series:
@@ -443,6 +514,20 @@ def main() -> None:
         use_container_width=True,
     ):
         st.session_state.show_layers = not st.session_state.show_layers
+    if "show_universe" not in st.session_state:
+        st.session_state.show_universe = False
+    if st.sidebar.button(
+        "Hide top-20 scanner" if st.session_state.show_universe else "Scan top 20 optionable",
+        use_container_width=True,
+    ):
+        st.session_state.show_universe = not st.session_state.show_universe
+    scanner_expiries = [date.today().isoformat(), _next_friday()]
+    scanner_expiry = st.sidebar.selectbox(
+        "Universe expiry",
+        scanner_expiries,
+        format_func=lambda value: f"{value} · {'TODAY' if value == date.today().isoformat() else 'FRIDAY'}",
+        disabled=not st.session_state.show_universe,
+    )
     if refresh:
         load_market_data.clear()
         load_chain.clear()
@@ -502,6 +587,8 @@ def main() -> None:
         "</div>",
         unsafe_allow_html=True,
     )
+    if st.session_state.show_universe:
+        render_universe_scan(scanner_expiry)
     if st.session_state.show_layers:
         try:
             history = load_price_history(symbol)

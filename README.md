@@ -16,6 +16,10 @@ Standalone Streamlit dashboard for public options-chain data. It shows dealer ga
 - Historical signal tests below 50% are highlighted red
 - Removed the Position Plan section for a cleaner institutional view
 
+## Top-20 expiry scanner
+
+Use **Scan top 20 optionable** in the sidebar to rank the liquid S&P universe by near-term option dollar volume, open interest, and bid/ask quality. The scanner supports exact `TODAY` and `FRIDAY` expirations. Yahoo may not publish an exact same-day chain for every symbol; those symbols are skipped instead of being replaced with a different expiry.
+
 ## Run locally
 
 ```powershell
