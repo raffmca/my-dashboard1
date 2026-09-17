@@ -103,6 +103,11 @@ def load_chain(symbol: str, expiration: str) -> tuple[pd.DataFrame, pd.DataFrame
     return calls, puts, None
 
 
+def _next_friday() -> str:
+    days_ahead = (4 - date.today().weekday()) % 7
+    return (date.today() + pd.Timedelta(days=days_ahead)).isoformat()
+
+
 def _scan_ticker(symbol: str, expiration: str) -> dict[str, Any] | None:
     try:
         yahoo_symbol = YAHOO_SYMBOLS.get(symbol, symbol)
@@ -161,7 +166,7 @@ def render_universe_scan(expiration: str, symbols: tuple[str, ...]) -> None:
     display = ranked[["Ticker", "Spot", "Option volume", "Dollar volume", "Open interest", "Spread %", "Tradeability"]].copy()
     display["Dollar volume"] = display["Dollar volume"] / 1_000_000
     display.columns = ["Ticker", "Spot", "Opt vol", "$ opt vol (M)", "OI", "Spread %", "Score"]
-    st.dataframe(display.style.format({"Spot": "${:.2f}", "$ opt vol (M)": "${:.1f}", "Spread %": "{:.2f}%", "Score": "{:.0f}"}), use_container_width=True, hide_index=True, height=520)
+    st.dataframe(display.style.format({"Spot": "${:.2f}", "$ opt vol (M)": "${:.1f}", "Spread %": "{:.2f}%", "Score": "{:.0f}"}), width="stretch", hide_index=True, height=520)
 
 
 def evaluate_actionable_signal(symbol: str, expiration: str) -> dict[str, Any] | None:
@@ -515,7 +520,7 @@ def render_chart(frame: pd.DataFrame, spot: float, levels: dict[str, float | str
         ),
         title=f"{symbol} / DEALER GAMMA BY STRIKE",
     )
-    st.plotly_chart(chart, use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(chart, width="stretch", config={"displayModeBar": False})
 
 
 def render_terminal() -> None:
@@ -596,7 +601,7 @@ def render_terminal() -> None:
     st.sidebar.markdown(f"<div class='terminal-label'>GAMMA SURFACE / PUBLIC DATA · {APP_VERSION.upper()}</div>", unsafe_allow_html=True)
     symbol = st.sidebar.text_input("Symbol", "SPY", max_chars=8).strip().upper()
     st.sidebar.caption("Yahoo Finance · delayed market data")
-    refresh = st.sidebar.button("Refresh data", use_container_width=True, type="primary")
+    refresh = st.sidebar.button("Refresh data", width="stretch", type="primary")
     if refresh:
         load_market_data.clear()
         load_chain.clear()
