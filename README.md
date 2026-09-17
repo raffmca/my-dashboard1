@@ -27,6 +27,16 @@ streamlit run app.py
 
 The app uses Yahoo Finance through `yfinance`; quotes and option chains may be delayed and can be unavailable outside market hours. No API key is required.
 
+## Optional password protection
+
+In Streamlit Community Cloud, open the app's **Settings > Secrets** and add:
+
+```toml
+dashboard_password = "choose-a-strong-password"
+```
+
+Save the secret and reboot the app. The dashboard will then show an unlock screen. If `dashboard_password` is absent, password protection is disabled for local testing.
+
 ## Deploy
 
 On Streamlit Community Cloud, select `app.py` as the main file and `requirements.txt` as the dependency file.

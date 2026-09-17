@@ -16,6 +16,23 @@ APP_VERSION = "Version 1.2"
 st.set_page_config(page_title="Gamma Surface", page_icon="◈", layout="wide")
 
 
+def authenticate() -> None:
+    configured_password = st.secrets.get("dashboard_password", "")
+    if not configured_password:
+        return
+    if st.session_state.get("authenticated", False):
+        return
+    st.title("Gamma Surface")
+    st.caption("Enter the dashboard password to continue.")
+    password = st.text_input("Password", type="password")
+    if st.button("Unlock dashboard", type="primary"):
+        if password == configured_password:
+            st.session_state.authenticated = True
+            st.rerun()
+        st.error("Incorrect password.")
+    st.stop()
+
+
 def _first_number(values: list[Any]) -> float | None:
     for value in values:
         try:
@@ -337,6 +354,7 @@ def render_chart(frame: pd.DataFrame, spot: float, levels: dict[str, float | str
 
 
 def main() -> None:
+    authenticate()
     st.markdown("""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Space+Grotesk:wght@500;600;700&display=swap');
