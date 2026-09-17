@@ -69,14 +69,21 @@ def load_market_data(symbol: str) -> tuple[float | None, list[str], str | None]:
         except Exception:
             spot = None
 
-    try:
-        expirations = list(ticker.options or [])
-    except Exception:
-        expirations = []
+    expirations: list[str] = []
+    options_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            expirations = list(yf.Ticker(symbol).options or [])
+            if expirations:
+                break
+        except Exception as exc:
+            options_error = exc
 
     if spot is None:
         return None, expirations, f"Could not load a current price for {symbol}."
     if not expirations:
+        if options_error:
+            return spot, [], f"Yahoo Finance temporarily failed to return options for {symbol}. Try Refresh data in a few seconds."
         return spot, [], f"No listed options were returned for {symbol}."
     return spot, expirations, None
 
