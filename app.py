@@ -122,6 +122,37 @@ def load_chain(symbol: str, expiration: str) -> tuple[pd.DataFrame, pd.DataFrame
     return calls, puts, None
 
 
+def load_chain_with_fallback(
+    symbol: str,
+    requested_expiration: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, str | None, str | None]:
+    """Try the requested expiry, then the next valid provider-listed expiry."""
+    _, expirations, market_error = load_market_data(symbol)
+    if market_error or not expirations:
+        return pd.DataFrame(), pd.DataFrame(), market_error or f"No listed options were returned for {symbol}.", None
+
+    candidates = _expiry_candidates(expirations, requested_expiration)
+    if not candidates:
+        return pd.DataFrame(), pd.DataFrame(), f"No listed expiry on or after {requested_expiration} was returned for {symbol}.", None
+
+    errors: list[str] = []
+    for expiration in candidates:
+        calls, puts, error = load_chain(symbol, expiration)
+        if error is None and not calls.empty and not puts.empty:
+            return calls, puts, None, expiration
+        if error:
+            errors.append(f"{expiration}: {error}")
+    return pd.DataFrame(), pd.DataFrame(), f"No usable option chain was returned for {symbol} after {requested_expiration}.", None
+
+
+def _expiry_candidates(expirations: list[str], requested_expiration: str) -> list[str]:
+    requested = date.fromisoformat(requested_expiration)
+    return [
+        expiration for expiration in sorted(expirations)
+        if date.fromisoformat(expiration) >= requested
+    ]
+
+
 def calculate_premium_sentiment(
     calls: pd.DataFrame,
     puts: pd.DataFrame,
@@ -182,15 +213,15 @@ def scan_premium_sentiment(expiration: str, symbols: tuple[str, ...]) -> pd.Data
     records: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=6) as executor:
         futures = {
-            executor.submit(load_chain, YAHOO_SYMBOLS.get(symbol, symbol), expiration): symbol
+            executor.submit(load_chain_with_fallback, YAHOO_SYMBOLS.get(symbol, symbol), expiration): symbol
             for symbol in symbols
         }
         for future in as_completed(futures):
             symbol = futures[future]
             try:
-                calls, puts, error = future.result()
+                calls, puts, error, used_expiration = future.result()
                 if not error:
-                    record = calculate_premium_sentiment(calls, puts, symbol, expiration)
+                    record = calculate_premium_sentiment(calls, puts, symbol, used_expiration or expiration)
                     if record:
                         records.append(record)
             except Exception:
@@ -296,13 +327,15 @@ def _scan_ticker(symbol: str, expiration: str) -> dict[str, Any] | None:
     try:
         yahoo_symbol = YAHOO_SYMBOLS.get(symbol, symbol)
         ticker = yf.Ticker(yahoo_symbol)
-        if expiration not in list(ticker.options or []):
+        available_expirations = _valid_expirations(list(ticker.options or []))
+        candidate_expirations = [item for item in available_expirations if item >= expiration]
+        if not candidate_expirations:
             return None
         info = ticker.fast_info
         spot = _first_number([info.get("lastPrice"), info.get("regularMarketPrice")])
         if spot is None:
             return None
-        chain = ticker.option_chain(expiration)
+        chain = ticker.option_chain(candidate_expirations[0])
         options = pd.concat([chain.calls, chain.puts], ignore_index=True)
         for column in ("volume", "openInterest", "bid", "ask"):
             options[column] = pd.to_numeric(options.get(column, 0), errors="coerce").fillna(0)
@@ -315,7 +348,7 @@ def _scan_ticker(symbol: str, expiration: str) -> dict[str, Any] | None:
         spread_dollars = float((active["ask"] - active["bid"]).clip(lower=0).mean()) if not active.empty else 0.0
         mid = ((active["ask"] + active["bid"]) / 2).replace(0, np.nan)
         spread_percent = float(((active["ask"] - active["bid"]) / mid).replace([np.inf, -np.inf], np.nan).dropna().mean() * 100) if not active.empty else 0.0
-        return {"Ticker": symbol, "Spot": spot, "Option volume": int(active["volume"].sum()), "Dollar volume": dollar_volume, "Open interest": open_interest, "Avg spread": spread_dollars, "Spread %": spread_percent}
+        return {"Ticker": symbol, "Expiration": candidate_expirations[0], "Spot": spot, "Option volume": int(active["volume"].sum()), "Dollar volume": dollar_volume, "Open interest": open_interest, "Avg spread": spread_dollars, "Spread %": spread_percent}
     except Exception:
         return None
 
@@ -347,9 +380,9 @@ def render_universe_scan(expiration: str, symbols: tuple[str, ...]) -> None:
     if ranked.empty or not symbols:
         st.warning(f"Yahoo returned no option chains for {expiration}.")
         return
-    display = ranked[["Ticker", "Spot", "Option volume", "Dollar volume", "Open interest", "Spread %", "Tradeability"]].copy()
+    display = ranked[["Ticker", "Expiration", "Spot", "Option volume", "Dollar volume", "Open interest", "Spread %", "Tradeability"]].copy()
     display["Dollar volume"] = display["Dollar volume"] / 1_000_000
-    display.columns = ["Ticker", "Spot", "Opt vol", "$ opt vol (M)", "OI", "Spread %", "Score"]
+    display.columns = ["Ticker", "Used expiry", "Spot", "Opt vol", "$ opt vol (M)", "OI", "Spread %", "Score"]
 
     def format_universe(value: Any) -> str:
         return "background-color: rgba(17, 26, 36, 0.9); color: #dce5ef;"
@@ -361,11 +394,12 @@ def render_universe_scan(expiration: str, symbols: tuple[str, ...]) -> None:
 def evaluate_actionable_signal(symbol: str, expiration: str) -> dict[str, Any] | None:
     yahoo_symbol = YAHOO_SYMBOLS.get(symbol, symbol)
     spot, expirations, error = load_market_data(yahoo_symbol)
-    if error or spot is None or expiration not in expirations:
+    if error or spot is None:
         return None
-    calls, puts, error = load_chain(yahoo_symbol, expiration)
+    calls, puts, error, used_expiration = load_chain_with_fallback(yahoo_symbol, expiration)
     if error:
         return None
+    expiration = used_expiration or expiration
     full_frame = build_gex_frame(calls, puts, spot, expiration)
     if full_frame.empty:
         return None
@@ -410,7 +444,7 @@ def evaluate_actionable_signal(symbol: str, expiration: str) -> dict[str, Any] |
         trigger = "Wait for wall acceptance or rejection"
         invalidation = "No trade without confirmation"
         target = "Next confirmed level"
-    return {"Ticker": symbol, "Setup": setup, "Spot": spot, "GEX": total_gex, "Gamma Flip": gamma_flip, "Put Wall": put_wall, "Call Wall": call_wall, "Rel Vol": relative_volume, "ATR": atr, "Why": reasons, "Trigger": trigger, "Invalidation": invalidation, "Target": target}
+    return {"Ticker": symbol, "Expiration": expiration, "Setup": setup, "Spot": spot, "GEX": total_gex, "Gamma Flip": gamma_flip, "Put Wall": put_wall, "Call Wall": call_wall, "Rel Vol": relative_volume, "ATR": atr, "Why": reasons, "Trigger": trigger, "Invalidation": invalidation, "Target": target}
 
 
 def render_actionable_signals(expiration: str, symbols: tuple[str, ...]) -> None:
@@ -429,7 +463,7 @@ def render_actionable_signals(expiration: str, symbols: tuple[str, ...]) -> None
     for signal in sorted(signals, key=lambda item: (item["Setup"] == "WAIT", -abs(item["GEX"]))):
         setup_class = "signal-red" if "SHORT" in signal["Setup"] or signal["Setup"] == "WAIT" else "signal-green" if "LONG" in signal["Setup"] else "signal-gold"
         reasons = "<br>".join(f"· {escape(reason)}" for reason in signal["Why"])
-        st.markdown(f"<div class='signal-card {setup_class}'><div class='signal-top'><b>{signal['Ticker']}</b><strong>{signal['Setup']}</strong><span>${signal['Spot']:.2f} · GEX {money(signal['GEX'])}</span></div><div class='signal-grid'><div><label>WHY</label><p>{reasons}</p></div><div><label>TRIGGER</label><p>{escape(signal['Trigger'])}</p></div><div><label>INVALIDATION</label><p>{escape(signal['Invalidation'])}</p></div><div><label>TARGET</label><p>{escape(signal['Target'])}</p></div></div><div class='signal-meta'>FLIP ${signal['Gamma Flip']:.2f} · PUT WALL ${signal['Put Wall']:.2f} · CALL WALL ${signal['Call Wall']:.2f} · REL VOL {signal['Rel Vol']:.1f}x · ATR ${signal['ATR']:.2f}</div></div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='signal-card {setup_class}'><div class='signal-top'><b>{signal['Ticker']}</b><strong>{signal['Setup']}</strong><span>${signal['Spot']:.2f} · GEX {money(signal['GEX'])} · EXP {signal['Expiration']}</span></div><div class='signal-grid'><div><label>WHY</label><p>{reasons}</p></div><div><label>TRIGGER</label><p>{escape(signal['Trigger'])}</p></div><div><label>INVALIDATION</label><p>{escape(signal['Invalidation'])}</p></div><div><label>TARGET</label><p>{escape(signal['Target'])}</p></div></div><div class='signal-meta'>FLIP ${signal['Gamma Flip']:.2f} · PUT WALL ${signal['Put Wall']:.2f} · CALL WALL ${signal['Call Wall']:.2f} · REL VOL {signal['Rel Vol']:.1f}x · ATR ${signal['ATR']:.2f}</div></div>", unsafe_allow_html=True)
 
 
 def calculate_gamma(spot: float, strike: pd.Series, days_to_expiry: int, volatility: pd.Series) -> pd.Series:

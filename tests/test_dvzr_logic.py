@@ -10,6 +10,7 @@ from app import (
     _friday_session,
     _is_trading_day,
     _effective_signal_date,
+    _expiry_candidates,
     _valid_expirations,
     _previous_trading_day,
     score_market_state,
@@ -102,3 +103,10 @@ def test_future_expirations_do_not_crash_calendar_validation():
 def test_signal_date_advances_after_market_close_and_skips_weekend():
     after_close = datetime(2026, 9, 18, 16, 1, tzinfo=ZoneInfo("America/New_York"))
     assert _effective_signal_date(after_close) == date(2026, 9, 21)
+
+
+def test_expiry_candidates_try_requested_then_next_available_week():
+    expirations = ["2026-09-25", "2026-10-02", "2026-10-09"]
+    assert _expiry_candidates(expirations, "2026-09-19") == expirations
+    assert _expiry_candidates(expirations, "2026-09-25") == expirations
+    assert _expiry_candidates(expirations, "2026-10-01") == ["2026-10-02", "2026-10-09"]
