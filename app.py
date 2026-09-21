@@ -1,41 +1,52 @@
 from __future__ import annotations
 
-from datetime import date
+import sqlite3
+import hmac
+from datetime import date, datetime, time, timedelta
 from html import escape
 from typing import Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
+import exchange_calendars as xcals
 from scipy.stats import norm
 
-APP_VERSION = "Version 2.0"
+APP_VERSION = "Version 3.0"
 S_AND_P_50 = (
     "AAPL MSFT NVDA AMZN META GOOGL AVGO TSLA BRK-B GOOG JPM WMT ORCL V LLY NFLX " \
     "COST JNJ HD PG BAC ABBV CVX KO MRK AMD PEP TMO CRM ACN MCD WFC LIN CSCO IBM " \
     "ABT GE NOW INTU ISRG QCOM TXN AMGN CAT PLTR DIS DHR VZ CMCSA PFE NEE".split()
 )
 TODAY_UNIVERSE = ("QQQ", "SPY", "IWM", "SPXW")
+MAG7 = ("AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "GOOG", "TSLA", "AMD", "AVGO", "PLTR", "NFLX")
+PREMIUM_SENTIMENT_UNIVERSE = ("SPY", "QQQ", "NVDA", "MU", "AAPL", "TSLA")
 YAHOO_SYMBOLS = {"SPXW": "^SPX"}
 
 st.set_page_config(page_title="Gamma Surface", page_icon="◈", layout="wide")
 
 
 def authenticate() -> None:
-    configured_password = st.secrets.get("dashboard_password")
+    try:
+        configured_password = st.secrets.get("dashboard_password")
+    except Exception:
+        configured_password = None
+
     if not configured_password:
-        st.error("Dashboard is not configured. Set the dashboard_password secret before running this app.")
-        st.stop()
+        return
+
     if st.session_state.get("authenticated", False):
         return
+
     st.title("Gamma Surface")
     st.caption("Enter the dashboard password to continue.")
     password = st.text_input("Password", type="password")
     if st.button("Unlock dashboard", type="primary"):
-        if password == configured_password:
+        if hmac.compare_digest(password, str(configured_password)):
             st.session_state.authenticated = True
             st.rerun()
         st.error("Incorrect password.")
@@ -81,6 +92,7 @@ def load_market_data(symbol: str) -> tuple[float | None, list[str], str | None]:
 
     if spot is None:
         return None, expirations, f"Could not load a current price for {symbol}."
+    expirations = _valid_expirations(expirations)
     if not expirations:
         if options_error:
             return spot, [], f"Yahoo Finance temporarily failed to return options for {symbol}. Try Refresh data in a few seconds."
@@ -110,9 +122,174 @@ def load_chain(symbol: str, expiration: str) -> tuple[pd.DataFrame, pd.DataFrame
     return calls, puts, None
 
 
-def _next_friday() -> str:
-    days_ahead = (4 - date.today().weekday()) % 7
-    return (date.today() + pd.Timedelta(days=days_ahead)).isoformat()
+def calculate_premium_sentiment(
+    calls: pd.DataFrame,
+    puts: pd.DataFrame,
+    symbol: str,
+    expiration: str,
+) -> dict[str, Any] | None:
+    """Estimate traded option premium from reported volume and bid/ask midpoint."""
+    required = {"volume", "bid", "ask", "strike"}
+    if not required.issubset(calls.columns) or not required.issubset(puts.columns):
+        return None
+
+    def prepare(frame: pd.DataFrame) -> pd.DataFrame:
+        result = frame.copy()
+        for column in ("volume", "bid", "ask", "strike"):
+            result[column] = pd.to_numeric(result[column], errors="coerce").fillna(0)
+        result["mid"] = ((result["bid"] + result["ask"]) / 2).clip(lower=0)
+        result["premium"] = result["volume"] * result["mid"] * 100
+        return result[(result["volume"] > 0) & (result["mid"] > 0)]
+
+    active_calls = prepare(calls)
+    active_puts = prepare(puts)
+    call_premium = float(active_calls["premium"].sum())
+    put_premium = float(active_puts["premium"].sum())
+    total_premium = call_premium + put_premium
+    if total_premium <= 0:
+        return None
+
+    net_premium = call_premium - put_premium
+    put_call_ratio = put_premium / call_premium if call_premium else np.inf
+    call_share = call_premium / total_premium
+    if put_call_ratio >= 1.35:
+        sentiment = "BEARISH / HEDGING"
+    elif put_call_ratio >= 1.1:
+        sentiment = "BEARISH / PROTECTIVE"
+    elif put_call_ratio <= 0.75:
+        sentiment = "BULLISH / DIRECTIONAL"
+    elif put_call_ratio <= 0.9:
+        sentiment = "BULLISH / CALL LEAN"
+    else:
+        sentiment = "NEUTRAL / EQUILIBRIUM"
+    return {
+        "Ticker": symbol,
+        "Expiration": expiration,
+        "Call Premium": call_premium,
+        "Put Premium": put_premium,
+        "Net Premium": net_premium,
+        "Call Share": call_share,
+        "Put/Call Premium": put_call_ratio,
+        "Sentiment": sentiment,
+        "Call Contracts": int(active_calls["volume"].sum()),
+        "Put Contracts": int(active_puts["volume"].sum()),
+        "Quoted Rows": len(active_calls) + len(active_puts),
+    }
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def scan_premium_sentiment(expiration: str, symbols: tuple[str, ...]) -> pd.DataFrame:
+    records: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = {
+            executor.submit(load_chain, YAHOO_SYMBOLS.get(symbol, symbol), expiration): symbol
+            for symbol in symbols
+        }
+        for future in as_completed(futures):
+            symbol = futures[future]
+            try:
+                calls, puts, error = future.result()
+                if not error:
+                    record = calculate_premium_sentiment(calls, puts, symbol, expiration)
+                    if record:
+                        records.append(record)
+            except Exception:
+                continue
+    if not records:
+        return pd.DataFrame()
+    return pd.DataFrame(records).sort_values("Net Premium", ascending=False).reset_index(drop=True)
+
+
+NYSE_CALENDAR = xcals.get_calendar("XNYS")
+NEW_YORK = ZoneInfo("America/New_York")
+MARKET_CLOSE = time(16, 0)
+
+
+def _calendar_holidays(start: date, end: date) -> set[date]:
+    holidays = NYSE_CALENDAR.regular_holidays.holidays(start=start.isoformat(), end=end.isoformat())
+    return {timestamp.date() for timestamp in holidays}
+
+
+def _is_trading_day(value: date) -> bool:
+    if value.weekday() >= 5:
+        return False
+    first_session = NYSE_CALENDAR.sessions[0].date()
+    last_session = NYSE_CALENDAR.sessions[-1].date()
+    if first_session <= value <= last_session:
+        return bool(NYSE_CALENDAR.is_session(pd.Timestamp(value)))
+    return value not in _calendar_holidays(value - timedelta(days=7), value + timedelta(days=7))
+
+
+def _previous_trading_day(value: date) -> date:
+    if _is_trading_day(value):
+        return value
+    candidate = value - timedelta(days=1)
+    while not _is_trading_day(candidate):
+        candidate -= timedelta(days=1)
+    return candidate
+
+
+def _next_trading_day(value: date) -> date:
+    candidate = value + timedelta(days=1)
+    while not _is_trading_day(candidate):
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def _effective_signal_date(now: datetime | None = None) -> date:
+    now = now.astimezone(NEW_YORK) if now else datetime.now(NEW_YORK)
+    session = now.date()
+    if not _is_trading_day(session):
+        return _next_trading_day(session - timedelta(days=1))
+    if now.time() >= MARKET_CLOSE:
+        return _next_trading_day(session)
+    return session
+
+
+def _friday_session(anchor: date | None = None) -> date:
+    anchor = anchor or date.today()
+    if anchor.weekday() >= 5:
+        friday = anchor - timedelta(days=anchor.weekday() - 4)
+    else:
+        friday = anchor + timedelta(days=4 - anchor.weekday())
+    while not _is_trading_day(friday):
+        friday -= timedelta(days=1)
+    return friday
+
+
+def _next_friday(anchor: date | None = None) -> date:
+    anchor = anchor or date.today()
+    current_friday = _friday_session(anchor)
+    if current_friday > anchor or (_is_trading_day(anchor) and anchor <= current_friday):
+        return current_friday
+    return _friday_session(current_friday + timedelta(days=3))
+
+
+def _valid_expirations(expirations: list[str]) -> list[str]:
+    return [expiration for expiration in expirations if _is_trading_day(date.fromisoformat(expiration))]
+
+
+def get_signal_expiry_options() -> list[str]:
+    today = _effective_signal_date()
+    options: list[str] = [today.isoformat()]
+    friday_date = _friday_session(today)
+    if friday_date != today:
+        options.append(friday_date.isoformat())
+    next_friday = _friday_session(friday_date + timedelta(days=3))
+    if next_friday != friday_date and next_friday != today:
+        options.append(next_friday.isoformat())
+    return options
+
+
+def get_signal_universe(expiry: str) -> tuple[str, ...]:
+    today = _effective_signal_date()
+    expiry_date = date.fromisoformat(expiry)
+    friday_date = _next_friday(today)
+    next_friday = _next_friday(friday_date + timedelta(days=1))
+    base = tuple(dict.fromkeys(TODAY_UNIVERSE + MAG7 + tuple(S_AND_P_50)))
+    if expiry_date in {today, friday_date, next_friday}:
+        return base
+    return base
 
 
 def _scan_ticker(symbol: str, expiration: str) -> dict[str, Any] | None:
@@ -173,7 +350,12 @@ def render_universe_scan(expiration: str, symbols: tuple[str, ...]) -> None:
     display = ranked[["Ticker", "Spot", "Option volume", "Dollar volume", "Open interest", "Spread %", "Tradeability"]].copy()
     display["Dollar volume"] = display["Dollar volume"] / 1_000_000
     display.columns = ["Ticker", "Spot", "Opt vol", "$ opt vol (M)", "OI", "Spread %", "Score"]
-    st.dataframe(display.style.format({"Spot": "${:.2f}", "$ opt vol (M)": "${:.1f}", "Spread %": "{:.2f}%", "Score": "{:.0f}"}), width="stretch", hide_index=True, height=520)
+
+    def format_universe(value: Any) -> str:
+        return "background-color: rgba(17, 26, 36, 0.9); color: #dce5ef;"
+
+    styled = display.style.format({"Spot": "${:.2f}", "$ opt vol (M)": "${:.1f}", "Spread %": "{:.2f}%", "Score": "{:.0f}"}).map(format_universe)
+    st.dataframe(styled, width="stretch", hide_index=True, height=520)
 
 
 def evaluate_actionable_signal(symbol: str, expiration: str) -> dict[str, Any] | None:
@@ -279,10 +461,12 @@ def focus_strikes(
     frame: pd.DataFrame,
     spot: float,
     required_strikes: list[float] | None = None,
+    strike_count: int = 41,
 ) -> pd.DataFrame:
     frame = frame.copy()
-    if len(frame) > 41:
-        nearest = set((frame["strike"] - spot).abs().nsmallest(41).index)
+    strike_count = max(1, min(strike_count, len(frame)))
+    if len(frame) > strike_count:
+        nearest = set((frame["strike"] - spot).abs().nsmallest(strike_count).index)
         required = set()
         for required_strike in required_strikes or []:
             required.add((frame["strike"] - required_strike).abs().idxmin())
@@ -448,7 +632,6 @@ def calculate_institutional_layers(
 
 
 def render_institutional_layers(layers: dict[str, Any], spot: float) -> None:
-    st.markdown("<div class='layer-title'>INSTITUTIONAL LAYERS <span>YAHOO-DERIVED SAMPLE · NOT INVESTMENT ADVICE</span></div>", unsafe_allow_html=True)
     vanna_class = "layer-negative" if layers["vanna"] < 0 else ""
     charm_class = "layer-negative" if layers["charm"] < 0 else ""
     cta_class = "layer-positive" if layers["cta"] == "TREND UP" else "layer-negative"
@@ -467,6 +650,13 @@ def render_institutional_layers(layers: dict[str, Any], spot: float) -> None:
 
 
 def render_chart(frame: pd.DataFrame, spot: float, levels: dict[str, float | str], symbol: str) -> None:
+    visible_min = float(frame["strike"].min())
+    visible_max = float(frame["strike"].max())
+
+    def is_visible(level: str) -> bool:
+        value = float(levels[level])
+        return visible_min <= value <= visible_max
+
     max_exposure = max(
         float(frame[["Call_GEX", "Put_GEX"]].abs().to_numpy().max()) / 1_000_000,
         1.0,
@@ -488,19 +678,21 @@ def render_chart(frame: pd.DataFrame, spot: float, levels: dict[str, float | str
         marker_color="#28d7a1",
         hovertemplate="Strike %{y:.2f}<br>Call GEX $%{x:.2f}M<extra></extra>",
     ))
-    chart.add_trace(go.Scatter(
-        x=[0],
-        y=[float(levels["max_pain"])],
-        mode="markers+text",
-        marker=dict(symbol="diamond", size=16, color="#f5c84b", line=dict(color="#080d14", width=3)),
-        text=[""],
-        name="Max pain",
-        hovertemplate="Max pain %{y:.2f}<extra></extra>",
-    ))
+    if is_visible("max_pain"):
+        chart.add_trace(go.Scatter(
+            x=[0],
+            y=[float(levels["max_pain"])],
+            mode="markers+text",
+            marker=dict(symbol="diamond", size=16, color="#f5c84b", line=dict(color="#080d14", width=3)),
+            text=[""],
+            name="Max pain",
+            hovertemplate="Max pain %{y:.2f}<extra></extra>",
+        ))
     chart.add_vline(x=0, line_color="#5e6b7d", line_width=1)
     chart.add_hline(y=spot, line_color="#f5c84b", line_width=2, annotation_text=f"SPOT ${spot:.2f}", annotation_position="top left", annotation_font_color="#f5c84b")
-    chart.add_hline(y=float(levels["max_pain"]), line_color="#f5c84b", line_dash="dash", line_width=1.5, opacity=0.9)
-    chart.add_annotation(
+    if is_visible("max_pain"):
+        chart.add_hline(y=float(levels["max_pain"]), line_color="#f5c84b", line_dash="dash", line_width=1.5, opacity=0.9)
+        chart.add_annotation(
         x=0,
         y=float(levels["max_pain"]),
         text=f"MAX PAIN ${float(levels['max_pain']):.2f}",
@@ -514,9 +706,10 @@ def render_chart(frame: pd.DataFrame, spot: float, levels: dict[str, float | str
         borderwidth=1,
         borderpad=4,
         font=dict(color="#f5c84b", size=10),
-    )
+        )
     for key, color in (("call_wall", "#28d7a1"), ("put_wall", "#ff557d"), ("gamma_flip", "#aa7cff")):
-        chart.add_hline(y=float(levels[key]), line_color=color, line_dash="dot", line_width=1, annotation_text=f"{key.replace('_', ' ').upper()} ${float(levels[key]):.2f}", annotation_font_color=color, annotation_position="top right")
+        if is_visible(key):
+            chart.add_hline(y=float(levels[key]), line_color=color, line_dash="dot", line_width=1, annotation_text=f"{key.replace('_', ' ').upper()} ${float(levels[key]):.2f}", annotation_font_color=color, annotation_position="top right")
     y_tick_step = 2 if spot < 300 else 5 if spot < 1000 else 10
     chart.update_layout(
         height=570,
@@ -534,10 +727,7 @@ def render_chart(frame: pd.DataFrame, spot: float, levels: dict[str, float | str
         ),
         yaxis=dict(
             title="Strike",
-            range=[
-                min(float(frame["strike"].min()), float(levels["max_pain"])),
-                max(float(frame["strike"].max()), float(levels["max_pain"])),
-            ],
+            range=[visible_min, visible_max],
             gridcolor="#1b2735",
             dtick=y_tick_step,
         ),
@@ -546,7 +736,160 @@ def render_chart(frame: pd.DataFrame, spot: float, levels: dict[str, float | str
     st.plotly_chart(chart, width="stretch", config={"displayModeBar": False})
 
 
-def render_terminal() -> None:
+def render_navigation_styles() -> None:
+    st.markdown("""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Space+Grotesk:wght@500;600;700&display=swap');
+    :root { --ink:#080d14; --panel:#111a24; --line:#243140; --muted:#8796a8; --green:#28d7a1; --red:#ff557d; --gold:#f5c84b; }
+    .stApp { background:radial-gradient(circle at 20% -10%, #15243b 0, #080d14 42%); color:#dce5ef; }
+    [data-testid='stAppViewContainer'], [data-testid='stHeader'] { background:transparent; }
+    h1,h2,h3,p,div,button,label { font-family:'Space Grotesk',sans-serif; }
+    code, .stMetricValue, [data-testid='stDataFrame'], .layer-title, .terminal-label { font-family:'DM Mono',monospace; }
+    section[data-testid='stSidebar'] { background:#0b121b; border-right:1px solid #243140; }
+    section[data-testid='stSidebar'] > div { background:#0b121b; }
+    [data-testid='stMetric'] { background:#111a24; border:1px solid #243140; padding:14px 16px; border-radius:6px; }
+    [data-testid='stMetricLabel'] { color:#8796a8; text-transform:uppercase; letter-spacing:.08em; font-size:.7rem; }
+    [data-testid='stMetricValue'] { color:#f5c84b; font:600 1.25rem 'DM Mono',monospace; }
+    .terminal-label { color:#8796a8; font:500 .7rem 'DM Mono',monospace; letter-spacing:.14em; text-transform:uppercase; }
+    .layer-title { color:#f5c84b; border-bottom:1px solid #243140; margin:26px 0 10px; padding-bottom:8px; font:600 .8rem 'DM Mono',monospace; letter-spacing:.1em; }
+    .layer-title span { color:#8796a8; font-size:.62rem; margin-left:8px; }
+    .signal-card { margin:10px 0; border:1px solid #243140; border-left:4px solid #f5c84b; border-radius:6px; background:#111a24; padding:14px 16px; }
+    .signal-card.signal-green { border-color:#1d765d; border-left-color:#28d7a1; background:linear-gradient(90deg,rgba(40,215,161,.13),#111a24 42%); }
+    .signal-card.signal-red { border-color:#783049; border-left-color:#ff557d; background:linear-gradient(90deg,rgba(255,85,125,.13),#111a24 42%); }
+    .signal-card.signal-gold { border-left-color:#f5c84b; background:linear-gradient(90deg,rgba(245,200,75,.10),#111a24 42%); }
+    .signal-top { display:grid; grid-template-columns:90px 1fr auto; gap:12px; align-items:center; color:#dce5ef; font:500 .82rem 'DM Mono',monospace; }
+    .signal-top b { color:#f5c84b; font-size:1rem; }
+    .signal-top strong { color:#28d7a1; letter-spacing:.05em; }
+    .signal-red .signal-top strong { color:#ff557d; }
+    .signal-gold .signal-top strong { color:#f5c84b; }
+    .signal-top span { color:#8796a8; text-align:right; }
+    .signal-grid { display:grid; grid-template-columns:2fr 1.2fr 1.2fr 1.2fr; gap:14px; margin-top:13px; }
+    .signal-grid label { color:#8796a8; font:500 .61rem 'DM Mono',monospace; letter-spacing:.1em; }
+    .signal-grid p { color:#dce5ef; font:400 .7rem 'DM Mono',monospace; line-height:1.65; margin:6px 0 0; }
+    .signal-meta { border-top:1px solid #243140; color:#8796a8; font:400 .62rem 'DM Mono',monospace; margin-top:12px; padding-top:9px; }
+    .summary-strip { display:grid; grid-template-columns:repeat(8,minmax(125px,1fr)); gap:8px; margin-top:18px; overflow-x:auto; }
+    .summary-card { min-height:76px; padding:10px 12px; border:1px solid #243140; border-radius:6px; background:#111a24; }
+    .summary-card-label { color:#dce5ef; font:600 .64rem 'Space Grotesk',sans-serif; text-transform:uppercase; white-space:nowrap; }
+    .summary-card-value { color:#28d7a1; font:600 1rem 'DM Mono',monospace; margin-top:7px; white-space:nowrap; }
+    .summary-card-value.negative { color:#ff557d; }
+    .summary-card-value.gold { color:#f5c84b; }
+    .summary-card-note { color:#8796a8; font:400 .61rem 'DM Mono',monospace; margin-top:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .layer-grid { display:grid; grid-template-columns:repeat(6,minmax(150px,1fr)); gap:8px; }
+    .layer-card { min-height:82px; border:1px solid #243140; border-radius:6px; padding:11px 13px; background:#0f1822; }
+    .layer-label { color:#8796a8; font:500 .66rem 'DM Mono',monospace; text-transform:uppercase; }
+    .layer-value { color:#28d7a1; font:600 .95rem 'DM Mono',monospace; margin-top:9px; }
+    .layer-value.gold { color:#f5c84b; }
+    .layer-value.layer-negative { color:#ff557d; }
+    .layer-value.layer-positive { color:#28d7a1; }
+    .layer-note { color:#8796a8; font:400 .62rem 'DM Mono',monospace; margin-top:5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    [data-testid='stDataFrame'], [data-testid='stDataFrame'] > div { background:#0d151f !important; }
+    [data-testid='stDataFrame'] table, [data-testid='stDataFrame'] th, [data-testid='stDataFrame'] td { background:#0d151f !important; color:#dce5ef !important; border-color:#243140 !important; }
+    [data-testid='stTabs'] button { color:#efe6a6 !important; font-family:'DM Mono',monospace !important; }
+    @media (max-width:1200px) { .layer-grid { grid-template-columns:repeat(3,minmax(180px,1fr)); } }
+    @media (max-width:900px) { .signal-grid { grid-template-columns:1fr 1fr; } .layer-grid { grid-template-columns:repeat(2,minmax(160px,1fr)); } }
+    @media (max-width:560px) { .signal-top { grid-template-columns:1fr; } .signal-top span { text-align:left; } .signal-grid,.layer-grid { grid-template-columns:1fr; } }
+    .desk-nav { border-right:1px solid #243140; }
+    .desk-nav-title { color:#f5c84b; font:600 .76rem 'DM Mono',monospace; letter-spacing:.12em; margin-bottom:12px; }
+    .desk-nav-status { color:#8796a8; font:400 .62rem 'DM Mono',monospace; margin:8px 0 14px; }
+    [data-testid='stSidebar'] .stButton > button { border:1px solid #243140; background:#111a24; color:#dce5ef; text-align:left; font:600 .74rem 'DM Mono',monospace; }
+    [data-testid='stSidebar'] .stButton > button:hover { border-color:#f5c84b; color:#f5c84b; }
+    [data-testid='stSidebar'] .nav-active .stButton > button { border:1px solid #f5c84b; color:#f5c84b; background:rgba(245,200,75,.12); box-shadow:inset 3px 0 #f5c84b; }
+    .mockup-shell { border:1px solid #243140; background:#0d151f; padding:14px; margin:12px 0; }
+    .mockup-rail { border-right:1px solid #243140; padding:10px; color:#8796a8; font:500 .7rem 'DM Mono',monospace; }
+    .mockup-rail strong { display:block; color:#f5c84b; border:1px solid #f5c84b; padding:8px; margin-bottom:8px; }
+    .mockup-content { min-height:130px; padding:10px; background:#111a24; color:#dce5ef; font:500 .72rem 'DM Mono',monospace; }
+    .mockup-card { display:inline-block; min-width:110px; margin:4px; padding:10px; border:1px solid #243140; color:#f5c84b; background:#162231; }
+    .premium-scope { margin:10px 0 8px; padding:9px 12px; border:1px solid #243140; background:#111a24; color:#dce5ef; font:500 .68rem 'DM Mono',monospace; letter-spacing:.04em; }
+    .premium-scope b { color:#f5c84b; }
+    .premium-metric-grid { display:grid; grid-template-columns:repeat(4,minmax(170px,1fr)); gap:8px; }
+    .premium-metric-card { min-height:76px; padding:11px 13px; border:1px solid #243140; border-left:3px solid #f5c84b; border-radius:6px; background:#111a24; }
+    .premium-metric-card > div { color:#dce5ef; font:600 .63rem 'DM Mono',monospace; }
+    .premium-metric-card strong { display:block; color:#f5c84b; font:600 1rem 'DM Mono',monospace; margin-top:7px; }
+    .premium-metric-card span { display:block; color:#8796a8; font:400 .6rem 'DM Mono',monospace; margin-top:4px; }
+    .premium-metric-grid.bullish .premium-metric-card { border-left-color:#28d7a1; }
+    .premium-metric-grid.bullish .premium-metric-card strong { color:#28d7a1; }
+    .premium-metric-grid.bearish .premium-metric-card { border-left-color:#ff557d; }
+    .premium-metric-grid.bearish .premium-metric-card strong { color:#ff557d; }
+    .premium-metric-grid.neutral .premium-metric-card { border-left-color:#f5c84b; }
+    @media (max-width:900px) { .premium-metric-grid { grid-template-columns:repeat(2,minmax(170px,1fr)); } }
+    @media (max-width:560px) { .premium-metric-grid { grid-template-columns:1fr; } }
+    </style>
+    """, unsafe_allow_html=True)
+
+
+def render_navigation() -> tuple[str, dict[str, Any]]:
+    if "active_view" not in st.session_state:
+        st.session_state.active_view = "gamma"
+
+    def select_view(view: str) -> None:
+        st.session_state.active_view = view
+
+    st.sidebar.markdown("<div class='desk-nav-title'>TRADING DESK / RESEARCH CONSOLE</div>", unsafe_allow_html=True)
+    st.sidebar.markdown("<div class='desk-nav-status'>ACTIVE VIEW · {} </div>".format(st.session_state.active_view.upper()), unsafe_allow_html=True)
+    labels = (("gamma", "GAMMA SURFACE"), ("signals", "SIGNALS"), ("dvzr", "DVZR SCANNER"), ("premium", "PREMIUM SENTIMENT"))
+    for view, label in labels:
+        active_class = "nav-active" if st.session_state.active_view == view else ""
+        st.sidebar.markdown(f"<div class='{active_class}'>", unsafe_allow_html=True)
+        st.sidebar.button(label, key=f"nav_{view}", on_click=select_view, args=(view,), use_container_width=True)
+        st.sidebar.markdown("</div>", unsafe_allow_html=True)
+
+    controls: dict[str, Any] = {}
+    active_view = st.session_state.active_view
+    if active_view == "gamma":
+        st.sidebar.markdown("---")
+        symbol = st.sidebar.text_input("Symbol", "SPY", max_chars=8, key="desk_symbol").strip().upper()
+        _, expirations, market_error = load_market_data(symbol)
+        if market_error or not expirations:
+            st.sidebar.warning(market_error or "No expirations available.")
+            controls.update(symbol=symbol, expiration=None, strike_count=41, refresh=False)
+        else:
+            today_expiration = _effective_signal_date().isoformat()
+            default_expiration = expirations.index(today_expiration) if today_expiration in expirations else 0
+            expiration = st.sidebar.selectbox("Expiration", expirations, index=default_expiration, key="desk_expiration", format_func=lambda value: f"{value} · {(date.fromisoformat(value) - date.today()).days}D")
+            controls["strike_count"] = st.sidebar.slider("Visible strike range", 10, 101, 41, key="desk_strike_count")
+            controls.update(symbol=symbol, expiration=expiration, refresh=st.sidebar.button("Refresh data", key="desk_refresh", use_container_width=True))
+    elif active_view == "signals":
+        st.sidebar.markdown("---")
+        expiry_options = get_signal_expiry_options()
+        signal_date = _effective_signal_date().isoformat()
+        controls["expiration"] = st.sidebar.radio("Signal expiry", expiry_options, format_func=lambda value: f"{value} · {'TODAY' if value == signal_date else 'FRIDAY'}", key="desk_signal_expiry")
+    elif active_view == "dvzr":
+        st.sidebar.markdown("---")
+        controls["filter_symbols"] = st.sidebar.text_input("Symbol filter (optional)", key="desk_dvzr_filter")
+        controls["run_scan"] = st.sidebar.button("Run DVZR scanner", type="primary", key="desk_dvzr_run", use_container_width=True)
+        controls["show_history"] = st.sidebar.checkbox("Show last-week picks", key="desk_dvzr_history")
+        controls["validation_symbol"] = st.sidebar.selectbox("Validation symbol", sorted(set(["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "JPM", "PG", "SPY", "QQQ", "IWM", "XLF", "XLK"])), key="desk_validation_symbol")
+        controls["run_validation"] = st.sidebar.button("Run historical validation", key="desk_validation_run", use_container_width=True)
+    elif active_view == "premium":
+        st.sidebar.markdown("---")
+        _, expirations, error = load_market_data("SPY")
+        if error or not expirations:
+            controls.update(expiration=None, symbols=(), run_scan=False)
+            st.sidebar.warning(error or "No benchmark expirations available.")
+        else:
+            today = _effective_signal_date().isoformat()
+            default_expiration = expirations.index(today) if today in expirations else 0
+            controls["expiration"] = st.sidebar.selectbox("Analysis expiry", expirations[:20], index=min(default_expiration, 19), key="desk_premium_expiry")
+            text = st.sidebar.text_input("Symbols", value=", ".join(PREMIUM_SENTIMENT_UNIVERSE), key="desk_premium_symbols")
+            controls["symbols"] = tuple(dict.fromkeys(symbol.strip().upper() for symbol in text.split(",") if symbol.strip()))
+            controls["run_scan"] = st.sidebar.button("Run premium sentiment", type="primary", key="desk_premium_run", use_container_width=True)
+
+    controls["show_mockups"] = st.sidebar.checkbox("Show theme mockups", key="desk_show_mockups")
+    return active_view, controls
+
+
+def render_theme_mockups() -> None:
+    st.markdown("<div class='layer-title'>THEME MOCKUPS <span>TRADING DESK · RESEARCH WORKBENCH · TERMINAL RAIL</span></div>", unsafe_allow_html=True)
+    themes = (
+        ("Trading Desk", "GAMMA SURFACE", "Bold metrics, compact rail, immediate action states."),
+        ("Research Workbench", "DVZR SCANNER", "Wider controls, evidence-first tables, slower research rhythm."),
+        ("Terminal Rail", "PREMIUM SENTIMENT", "Dense monospace navigation with minimal visual noise."),
+    )
+    for name, active, description in themes:
+        st.markdown(f"<div class='mockup-shell'><b>{name.upper()}</b><br><span class='layer-note'>{description}</span><div style='display:grid;grid-template-columns:180px 1fr;margin-top:10px'><div class='mockup-rail'><strong>{active}</strong> SIGNALS<br><br>DVZR<br><br>PREMIUM SENTIMENT</div><div class='mockup-content'><div class='mockup-card'>NET GEX<br><b>+$1.2M</b></div><div class='mockup-card'>SIGNAL<br><b>RANGE / FADE</b></div><div class='mockup-card'>EVIDENCE<br><b>3D HIT 64%</b></div></div></div></div>", unsafe_allow_html=True)
+
+
+def render_terminal(controls: dict[str, Any] | None = None) -> None:
     st.markdown("""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Space+Grotesk:wght@500;600;700&display=swap');
@@ -587,9 +930,9 @@ def render_terminal() -> None:
     .summary-card-value.negative { color:#ff557d; }
     .summary-card-value.gold { color:#f5c84b; }
     .summary-card-note { color:#8796a8; font:400 .61rem 'DM Mono',monospace; margin-top:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-    .layer-title { color:#dce5ef; border-bottom:1px solid #243140; margin:26px 0 10px; padding-bottom:8px; font:600 .8rem 'DM Mono',monospace; letter-spacing:.1em; }
+    .layer-title { color:#f5c84b; border-bottom:1px solid #243140; margin:26px 0 10px; padding-bottom:8px; font:600 .8rem 'DM Mono',monospace; letter-spacing:.1em; }
     .layer-title span { color:#8796a8; font-size:.62rem; margin-left:8px; }
-    .layer-grid { display:grid; grid-template-columns:repeat(3, minmax(180px, 1fr)); gap:8px; }
+    .layer-grid { display:grid; grid-template-columns:repeat(6, minmax(150px, 1fr)); gap:8px; }
     .layer-card { min-height:82px; border:1px solid #243140; border-radius:6px; padding:11px 13px; background:#0f1822; }
     .layer-label { color:#8796a8; font:500 .66rem 'DM Mono',monospace; text-transform:uppercase; }
     .layer-label span { color:#aa7cff; font-size:.56rem; }
@@ -615,17 +958,20 @@ def render_terminal() -> None:
     .signal-date-label { color:#f5c84b; font:500 .72rem 'DM Mono',monospace; letter-spacing:.08em; }
     [data-testid='stRadio'] label { color:#f5c84b !important; font:500 .72rem 'DM Mono',monospace !important; }
     [data-testid='stRadio'] label p { color:#f5c84b !important; }
-    [data-testid='stTabs'] button { color:#8796a8 !important; font-family:'DM Mono',monospace !important; }
-    [data-testid='stTabs'] button[aria-selected='true'] { color:#f5c84b !important; }
+    [data-testid='stDataFrame'] { background:#0d151f !important; }
+    [data-testid='stDataFrame'] > div { background:#0d151f !important; }
+    [data-testid='stDataFrame'] table, [data-testid='stDataFrame'] th, [data-testid='stDataFrame'] td { background:#0d151f !important; color:#dce5ef !important; border-color:#243140 !important; }
+    [data-testid='stTabs'] button { color:#efe6a6 !important; font-family:'DM Mono',monospace !important; }
+    [data-testid='stTabs'] button[aria-selected='true'] { color:#f9efb8 !important; background:rgba(249, 239, 184, 0.12) !important; }
+    @media (max-width: 1200px) { .layer-grid { grid-template-columns:repeat(3, minmax(180px, 1fr)); } }
     @media (max-width: 900px) { .layer-grid { grid-template-columns:repeat(2, minmax(160px, 1fr)); } }
     @media (max-width: 560px) { .layer-grid { grid-template-columns:1fr; } }
     </style>
     """, unsafe_allow_html=True)
-    st.sidebar.markdown(f"<div class='terminal-label'>GAMMA SURFACE / PUBLIC DATA · {APP_VERSION.upper()}</div>", unsafe_allow_html=True)
-    symbol = st.sidebar.text_input("Symbol", "SPY", max_chars=8).strip().upper()
-    st.sidebar.caption("Yahoo Finance · delayed market data")
-    refresh = st.sidebar.button("Refresh data", width="stretch", type="primary")
-    if refresh:
+    controls = controls or {}
+    symbol = controls.get("symbol", "SPY")
+    expiration = controls.get("expiration")
+    if controls.get("refresh"):
         load_market_data.clear()
         load_chain.clear()
 
@@ -635,16 +981,16 @@ def render_terminal() -> None:
     if market_error:
         st.error(market_error)
         return
-    today_expiration = date.today().isoformat()
-    default_expiration = expirations.index(today_expiration) if today_expiration in expirations else 0
-    expiration = st.sidebar.selectbox("Expiration", expirations, index=default_expiration, format_func=lambda value: f"{value}  ·  {(date.fromisoformat(value) - date.today()).days}D")
+    if not expiration:
+        expiration = expirations[0]
     calls, puts, chain_error = load_chain(symbol, expiration)
     if chain_error or spot is None:
         st.error(chain_error or "No spot price available.")
         return
     full_frame = build_gex_frame(calls, puts, spot, expiration)
     levels = find_levels(full_frame, spot)
-    frame = focus_strikes(full_frame, spot, [float(levels["max_pain"])])
+    strike_count = min(int(controls.get("strike_count", 41)), len(full_frame))
+    frame = focus_strikes(full_frame, spot, [float(levels["max_pain"])], strike_count)
     total = float(frame["Net_GEX"].sum())
     days_to_expiry = max((date.fromisoformat(expiration) - date.today()).days, 1)
     spot_strike = float(frame.loc[(frame["strike"] - spot).abs().idxmin(), "strike"])
@@ -669,12 +1015,43 @@ def render_terminal() -> None:
     render_chart(frame, spot, levels, symbol)
     st.subheader("Strike matrix")
     render_matrix(frame, spot, levels)
+    st.caption(f"Visible range: {len(frame)} strikes around spot · Full list: {len(full_frame)} strikes below")
+    full_display = full_frame.rename(columns={
+        "strike": "Strike",
+        "Call_GEX": "Call GEX",
+        "Put_GEX": "Put GEX",
+        "Net_GEX": "Net GEX",
+        "Call_OI": "Call OI",
+        "Put_OI": "Put OI",
+    })[["Strike", "Call GEX", "Net GEX", "Put GEX", "Call OI", "Put OI"]]
+    full_display_style = full_display.style.set_properties(**{
+        "background-color": "#0d151f",
+        "color": "#dce5ef",
+        "border-color": "#243140",
+    }).set_table_styles([
+        {"selector": "th", "props": [("background-color", "#162231"), ("color", "#f5c84b"), ("border-color", "#243140")]},
+        {"selector": "td", "props": [("background-color", "#0d151f"), ("color", "#dce5ef"), ("border-color", "#243140")]},
+    ]).format({
+        "Strike": "{:.2f}",
+        "Call GEX": money,
+        "Net GEX": money,
+        "Put GEX": money,
+        "Call OI": "{:.0f}",
+        "Put OI": "{:.0f}",
+    })
+    st.dataframe(
+        full_display_style,
+        width="stretch",
+        hide_index=True,
+        height=420,
+    )
     total_class = "" if total >= 0 else " negative"
     grower_class = "" if grower >= 0 else " negative"
     st.markdown(
         f"<div class='summary-strip'>"
         f"<div class='summary-card'><div class='summary-card-label'>Net GEX · {expiration}</div><div class='summary-card-value{total_class}'>{money(total)}</div><div class='summary-card-note'>{levels['regime']}</div></div>"
         f"<div class='summary-card'><div class='summary-card-label'>Call Wall · {expiration}</div><div class='summary-card-value'>${float(levels['call_wall']):.2f}</div><div class='summary-card-note'>{float(levels['call_wall']) - spot:+.2f} from spot</div></div>"
+        f"<div class='summary-card'><div class='summary-card-label'>Put Wall · {expiration}</div><div class='summary-card-value'>${float(levels['put_wall']):.2f}</div><div class='summary-card-note'>{float(levels['put_wall']) - spot:+.2f} from spot</div></div>"
         f"<div class='summary-card'><div class='summary-card-label'>Volt · {expiration}</div><div class='summary-card-value gold'>${volt_strike:.0f}</div><div class='summary-card-note'>nearest listed strike</div></div>"
         f"<div class='summary-card'><div class='summary-card-label'>Gamma Flip · {expiration}</div><div class='summary-card-value'>${float(levels['gamma_flip']):.2f}</div><div class='summary-card-note'>{float(levels['gamma_flip']) - spot:+.2f} from spot</div></div>"
         f"<div class='summary-card'><div class='summary-card-label'>Max Pain · {expiration}</div><div class='summary-card-value gold'>${float(levels['max_pain']):.2f}</div><div class='summary-card-note'>{float(levels['max_pain']) - spot:+.2f} from spot</div></div>"
@@ -684,13 +1061,13 @@ def render_terminal() -> None:
         "</div>",
         unsafe_allow_html=True,
     )
-def render_institutional_tab() -> None:
-    symbol = st.selectbox("Institutional ticker", ["SPY", "QQQ", "IWM", "AAPL", "NVDA"], key="institutional_symbol")
-    spot, expirations, error = load_market_data(symbol)
+    render_institutional_tab(symbol, expiration)
+def render_institutional_tab(symbol: str, expiration: str) -> None:
+    st.markdown("<div class='layer-title'>INSTITUTIONAL LAYERS <span>YAHOO-DERIVED SAMPLE · NOT INVESTMENT ADVICE</span></div>", unsafe_allow_html=True)
+    spot, _, error = load_market_data(symbol)
     if error or spot is None:
         st.warning(error or "No price data available.")
         return
-    expiration = st.selectbox("Institutional expiry", expirations[:10], key="institutional_expiry")
     calls, puts, error = load_chain(symbol, expiration)
     if error:
         st.warning(error)
@@ -702,21 +1079,514 @@ def render_institutional_tab() -> None:
         st.warning(f"Institutional layers unavailable: {exc}")
 
 
+DB_FILE = "dvzr_signals.db"
+
+
+def init_dvzr_db() -> None:
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dvzr_signals (
+            snapshot_date TEXT,
+            symbol TEXT,
+            asset_class TEXT,
+            close_price REAL,
+            z_score REAL,
+            signal TEXT,
+            days_in_state INTEGER,
+            sustainability_score REAL,
+            signal_score REAL,
+            volatility_ratio REAL,
+            event_risk TEXT,
+            atr_14 REAL,
+            PRIMARY KEY (snapshot_date, symbol)
+        )
+        """
+    )
+    existing_columns = {row[1] for row in cursor.execute("PRAGMA table_info(dvzr_signals)")}
+    for column_name, column_type in (("signal_score", "REAL"), ("volatility_ratio", "REAL")):
+        if column_name not in existing_columns:
+            cursor.execute(f"ALTER TABLE dvzr_signals ADD COLUMN {column_name} {column_type}")
+    conn.commit()
+    conn.close()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_market_data(symbol: str, period: str = "1y") -> pd.DataFrame:
+    try:
+        data = yf.download(symbol, period=period, progress=False, auto_adjust=False)
+        if isinstance(data.columns, pd.MultiIndex):
+            data = data.xs(symbol, level=1, axis=1)
+        if not data.empty and len(data) >= 200:
+            return data
+    except Exception:
+        return pd.DataFrame()
+    return pd.DataFrame()
+
+
+def _event_risk_flags(df: pd.DataFrame) -> str:
+    if df.empty:
+        return "none"
+    close = pd.to_numeric(df["Close"], errors="coerce")
+    volume = pd.to_numeric(df["Volume"], errors="coerce").fillna(0)
+    recent_gap = abs(close.pct_change().fillna(0.0)).iloc[-1]
+    volume_ratio = float(volume.iloc[-1] / volume.rolling(20).mean().iloc[-1]) if volume.rolling(20).mean().iloc[-1] else 0.0
+    flags: list[str] = []
+    if recent_gap > 0.06:
+        flags.append("gap move")
+    if volume_ratio > 1.8:
+        flags.append("volume spike")
+    if (close.iloc[-1] - close.rolling(20).mean().iloc[-1]) / close.rolling(20).std().iloc[-1] if len(close) >= 20 and pd.notna(close.rolling(20).std().iloc[-1]) and close.rolling(20).std().iloc[-1] != 0 else 0.0 > 2.5:
+        flags.append("trend break")
+    return "; ".join(flags) if flags else "none"
+
+
+def score_market_state(df: pd.DataFrame) -> dict[str, Any]:
+    close = pd.to_numeric(df["Close"], errors="coerce").dropna()
+    if close.empty or len(close) < 200:
+        return {
+            "signal": "NEUTRAL",
+            "days_in_state": 0,
+            "z_score": 0.0,
+            "sustainability_score": 0.0,
+            "signal_score": 0.0,
+            "volatility_ratio": 0.0,
+            "event_risk": "insufficient data",
+            "atr_14": 0.0,
+        }
+
+    sma_200 = close.rolling(200).mean()
+    sma_20 = close.rolling(20).mean()
+    std_20 = close.rolling(20).std().replace(0, np.nan)
+    standard_z = ((close - sma_20) / std_20).replace([np.inf, -np.inf], np.nan)
+    rolling_median = close.rolling(20).median()
+    median_deviation = (close - rolling_median).abs().rolling(20).median().replace(0, np.nan)
+    robust_z = (0.6745 * (close - rolling_median) / median_deviation).replace([np.inf, -np.inf], np.nan)
+    z_score = robust_z.fillna(standard_z)
+
+    high_low = pd.to_numeric(df["High"], errors="coerce") - pd.to_numeric(df["Low"], errors="coerce")
+    prev_close = close.shift(1)
+    tr = pd.concat([high_low, (pd.to_numeric(df["High"], errors="coerce") - prev_close).abs(), (pd.to_numeric(df["Low"], errors="coerce") - prev_close).abs()], axis=1).max(axis=1)
+    atr_14 = tr.rolling(14).mean()
+
+    current_close = float(close.iloc[-1])
+    current_z = float(z_score.iloc[-1])
+    current_sma200 = float(sma_200.iloc[-1])
+    current_atr = float(atr_14.iloc[-1])
+    sma20_slope = float(sma_20.iloc[-1] - sma_20.iloc[-6]) if len(sma_20.dropna()) >= 6 else 0.0
+    trend_up = current_close > current_sma200 and sma20_slope > 0
+    trend_down = current_close < current_sma200 and sma20_slope < 0
+
+    if trend_up and current_z <= -1.75:
+        signal = "BUY (Oversold Dip)"
+        state_mask = (z_score <= -1.75) & (close > sma_200)
+    elif trend_down and current_z >= 1.75:
+        signal = "SELL / SHORT (Overbought)"
+        state_mask = (z_score >= 1.75) & (close < sma_200)
+    else:
+        signal = "NEUTRAL"
+        state_mask = pd.Series(False, index=z_score.index)
+
+    days_in_state = 0
+    for val in reversed(state_mask.values.tolist()):
+        if val:
+            days_in_state += 1
+        else:
+            break
+
+    atr_10 = tr.rolling(10).mean().iloc[-1]
+    atr_100 = tr.rolling(100).mean().iloc[-1]
+    vol_ratio = atr_10 / atr_100 if atr_100 > 0 else 1.0
+    event_risk = _event_risk_flags(df)
+    z_strength = min(abs(current_z) / 3.0, 1.0) * 45
+    trend_score = 25 if (signal != "NEUTRAL" and ((signal.startswith("BUY") and trend_up) or (signal.startswith("SELL") and trend_down))) else 0
+    persistence_score = min(days_in_state, 5) / 5 * 15
+    volatility_score = 15 if 0.75 <= vol_ratio <= 1.35 else 5 if vol_ratio <= 1.6 else 0
+    event_penalty = 25 if event_risk != "none" else 0
+    signal_score = float(np.clip(z_strength + trend_score + persistence_score + volatility_score - event_penalty, 0, 100))
+    sustainability_score = float(np.clip(100 - (vol_ratio * 35), 10, 95))
+
+    if event_risk != "none" and signal != "NEUTRAL":
+        signal = "WAIT (EVENT RISK)"
+
+    return {
+        "signal": signal,
+        "days_in_state": days_in_state,
+        "z_score": round(current_z, 2),
+        "sustainability_score": round(sustainability_score, 1),
+        "signal_score": round(signal_score, 1),
+        "volatility_ratio": round(float(vol_ratio), 2),
+        "event_risk": event_risk,
+        "atr_14": round(current_atr, 2),
+    }
+
+
+def calculate_forward_return_validation(
+    df: pd.DataFrame,
+    horizons: tuple[int, ...] = (1, 3, 5, 10),
+) -> pd.DataFrame:
+    """Evaluate historical signals using only prices known at each signal date."""
+    if df.empty or "Close" not in df or len(df) < 210:
+        return pd.DataFrame()
+
+    history = df.reset_index(drop=True).copy()
+    close = pd.to_numeric(history["Close"], errors="coerce")
+    observations: list[dict[str, Any]] = []
+    first_signal = 200
+    last_signal = len(history) - max(horizons) - 1
+    for signal_index in range(first_signal, last_signal + 1):
+        state = score_market_state(history.iloc[: signal_index + 1])
+        signal = state["signal"]
+        if signal == "NEUTRAL" or signal.startswith("WAIT"):
+            continue
+        direction = 1 if signal.startswith("BUY") else -1
+        score = float(state["signal_score"])
+        bucket = "0-39" if score < 40 else "40-59" if score < 60 else "60-79" if score < 80 else "80-100"
+        row: dict[str, Any] = {
+            "Signal date": history.index[signal_index],
+            "Signal": "BUY" if direction == 1 else "SELL",
+            "Score bucket": bucket,
+            "Signal score": score,
+        }
+        for horizon in horizons:
+            raw_return = float(close.iloc[signal_index + horizon] / close.iloc[signal_index] - 1)
+            row[f"{horizon}D return"] = raw_return
+            row[f"{horizon}D directional return"] = raw_return * direction
+        observations.append(row)
+
+    if not observations:
+        return pd.DataFrame()
+    return pd.DataFrame(observations)
+
+
+def summarize_forward_return_validation(observations: pd.DataFrame) -> pd.DataFrame:
+    if observations.empty:
+        return pd.DataFrame()
+    rows: list[dict[str, Any]] = []
+    horizons = (1, 3, 5, 10)
+    for bucket, group in observations.groupby("Score bucket", sort=False):
+        row: dict[str, Any] = {
+            "Score bucket": bucket,
+            "Signals": len(group),
+        }
+        for horizon in horizons:
+            directional = group[f"{horizon}D directional return"]
+            row[f"{horizon}D avg"] = float(directional.mean())
+            row[f"{horizon}D median"] = float(directional.median())
+            row[f"{horizon}D hit rate"] = float((directional > 0).mean())
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_forward_return_validation(symbol: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    observations = calculate_forward_return_validation(fetch_market_data(symbol, period="2y"))
+    return observations, summarize_forward_return_validation(observations)
+
+
+def analyze_market_state(symbol: str, asset_class: str) -> dict[str, Any] | None:
+    symbol = symbol.strip().upper()
+    if not symbol:
+        return None
+    df = fetch_market_data(symbol)
+    if df.empty:
+        return None
+    state = score_market_state(df)
+    if not state:
+        return None
+    return {
+        "Symbol": symbol,
+        "Asset Class": asset_class,
+        "Close Price": round(float(pd.to_numeric(df["Close"], errors="coerce").dropna().iloc[-1]), 2),
+        "Z-Score": state["z_score"],
+        "Signal": state["signal"],
+        "Days in State": state["days_in_state"],
+        "Sustainability Score": f"{state['sustainability_score']}%",
+        "Signal Score": state["signal_score"],
+        "Volatility Ratio": state["volatility_ratio"],
+        "Event Risk": state["event_risk"],
+        "ATR(14)": state["atr_14"],
+    }
+
+
+def save_signals_to_db(df_results: pd.DataFrame) -> None:
+    conn = sqlite3.connect(DB_FILE)
+    for _, row in df_results.iterrows():
+        sust_val = float(str(row["Sustainability Score"]).replace("%", "")) if isinstance(row["Sustainability Score"], str) else float(row["Sustainability Score"])
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO dvzr_signals (
+                snapshot_date, symbol, asset_class, close_price, z_score, signal, days_in_state,
+                sustainability_score, signal_score, volatility_ratio, event_risk, atr_14
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                date.today().isoformat(),
+                row["Symbol"],
+                row["Asset Class"],
+                float(row["Close Price"]),
+                float(row["Z-Score"]),
+                row["Signal"],
+                int(row["Days in State"]),
+                sust_val,
+                float(row.get("Signal Score", 0.0)),
+                float(row.get("Volatility Ratio", 0.0)),
+                row.get("Event Risk", "none"),
+                float(row.get("ATR(14)", 0.0)),
+            ),
+        )
+    conn.commit()
+    conn.close()
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_recent_picks() -> pd.DataFrame:
+    conn = sqlite3.connect(DB_FILE)
+    query = """
+        SELECT *
+        FROM dvzr_signals
+        WHERE snapshot_date >= date('now', '-7 days')
+        ORDER BY snapshot_date DESC, symbol ASC
+    """
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+    return df
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_last_20_day_history(symbol: str) -> pd.DataFrame:
+    history = fetch_market_data(symbol, period="6mo")
+    if history.empty:
+        return pd.DataFrame()
+    window = history.tail(20).copy()
+    if "Close" not in window.columns:
+        return pd.DataFrame()
+    window["sma_20"] = window["Close"].rolling(20).mean()
+    window["z_score"] = ((window["Close"] - window["sma_20"]) / window["Close"].rolling(20).std().replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+    return window
+
+
+def render_dvzr_dashboard(controls: dict[str, Any] | None = None) -> None:
+    controls = controls or {}
+    init_dvzr_db()
+    st.markdown("<div class='terminal-label'>DVZR / DYNAMIC VOLATILITY Z-SCORE REVERSION</div>", unsafe_allow_html=True)
+    st.title("Mean Reversion Watchlist")
+    st.caption("Yahoo Finance scan · z-score breaches · event-risk filters · SQLite cache")
+
+    default_stocks = ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "JPM", "PG"]
+    default_etfs = ["SPY", "QQQ", "IWM", "XLF", "XLK"]
+    default_futures = ["ES=F", "NQ=F", "CL=F", "GC=F"]
+    watchlist_default = ", ".join(default_stocks + default_etfs + default_futures)
+    filter_symbols = controls.get("filter_symbols", "")
+    run_scan = bool(controls.get("run_scan"))
+    show_history = bool(controls.get("show_history"))
+
+    if run_scan:
+        selected_symbols = []
+        raw_filter = filter_symbols.strip()
+        if raw_filter:
+            selected_symbols = [x.strip().upper() for x in raw_filter.split(",") if x.strip()]
+        else:
+            selected_symbols = [s.strip().upper() for s in watchlist_default.split(",") if s.strip()]
+
+        rows: list[dict[str, Any]] = []
+        with st.spinner("Scanning for mean-reversion setups and event-risk filters..."):
+            for item in selected_symbols:
+                if not item:
+                    continue
+                asset = "Stock" if item not in {"SPY", "QQQ", "IWM", "XLF", "XLK", "ES=F", "NQ=F", "CL=F", "GC=F"} else ("ETF" if "=" not in item else "Futures")
+                result = analyze_market_state(item, asset)
+                if result:
+                    rows.append(result)
+
+        if rows:
+            df = pd.DataFrame(rows)
+            df = df.sort_values(["Signal"], key=lambda s: s.str.contains("BUY").map({True: 0, False: 1}), ascending=True)
+            save_signals_to_db(df)
+            st.markdown("<div class='layer-title'>DVZR SCAN RESULTS <span>QUALIFYING SIGNALS & EVENT FILTERS</span></div>", unsafe_allow_html=True)
+            buy_count = int((df["Signal"].str.contains("BUY", na=False)).sum())
+            wait_count = int((df["Signal"].str.contains("WAIT", na=False)).sum())
+            st.metric("Signals scanned", len(df))
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Qualifying buys", buy_count)
+            col2.metric("Event-risk holds", wait_count)
+            col3.metric("Neutral", int((df["Signal"] == "NEUTRAL").sum()))
+            display = df[["Symbol", "Asset Class", "Close Price", "Z-Score", "Signal", "Signal Score", "Days in State", "Sustainability Score", "Volatility Ratio", "Event Risk", "ATR(14)"]].copy()
+
+            def dvzr_style(value: Any) -> str:
+                if "BUY" in str(value):
+                    return "background-color: rgba(40, 215, 161, 0.18); color: #dffaf0;"
+                if "SELL" in str(value):
+                    return "background-color: rgba(255, 85, 125, 0.18); color: #ffd7e2;"
+                if "WAIT" in str(value):
+                    return "background-color: rgba(245, 200, 75, 0.12); color: #f7e9a7;"
+                return "background-color: rgba(17, 26, 36, 0.9); color: #dce5ef;"
+
+            styled_display = display.style.map(dvzr_style, subset=["Signal"]).set_properties(**{"background-color": "rgba(17, 26, 36, 0.9)", "color": "#dce5ef", "border": "1px solid #243140"})
+            st.dataframe(styled_display, use_container_width=True, hide_index=True, height=420)
+        else:
+            st.warning("No valid market data was returned by Yahoo Finance for the selected filter.")
+
+    if show_history:
+        st.markdown("<div class='layer-title'>LAST-WEEK DVZR PICKS <span>LAST 7 DAYS OF SIGNAL HISTORY</span></div>", unsafe_allow_html=True)
+        history = get_recent_picks()
+        if history.empty:
+            st.info("No recent DVZR records are saved yet. Run the scanner first to create history.")
+        else:
+            picks = history[["snapshot_date", "symbol", "asset_class", "close_price", "z_score", "signal", "signal_score", "days_in_state", "volatility_ratio", "event_risk", "sustainability_score"]].copy()
+            picks.columns = ["Snapshot", "Symbol", "Asset class", "Close", "Z-Score", "Signal", "Signal score", "Days in state", "Vol ratio", "Event risk", "Sust. score"]
+            st.dataframe(picks, use_container_width=True, hide_index=True)
+
+            selected = st.selectbox("Review 20-day history for", sorted(picks["Symbol"].unique().tolist()), index=0)
+            hist = get_last_20_day_history(selected)
+            if hist.empty:
+                st.warning(f"Not enough price history for {selected} to build a 20-day rolling view.")
+            else:
+                st.line_chart(hist[["Close", "sma_20"]])
+                st.dataframe(hist.tail(20)[["Close", "sma_20", "z_score"]].reset_index().rename(columns={"index": "Date"}), use_container_width=True, hide_index=True)
+
+    st.markdown("<div class='layer-title'>FORWARD-RETURN VALIDATION <span>POINT-IN-TIME · DIRECTIONAL HIT RATE</span></div>", unsafe_allow_html=True)
+    validation_symbol = controls.get("validation_symbol", sorted(set(default_stocks + default_etfs))[0])
+    run_validation = bool(controls.get("run_validation"))
+    if run_validation:
+        with st.spinner(f"Evaluating historical DVZR signals for {validation_symbol}..."):
+            observations, validation = get_forward_return_validation(validation_symbol)
+        if validation.empty:
+            st.info("No qualifying historical signals were found with enough forward data.")
+        else:
+            st.caption("Returns are direction-adjusted: positive means the signal direction was correct. Event-risk and neutral states are excluded.")
+            percentage_columns = [column for column in validation.columns if column.endswith(("avg", "median", "hit rate"))]
+            st.dataframe(
+                validation.style.format({column: "{:.1%}" for column in percentage_columns}),
+                use_container_width=True,
+                hide_index=True,
+            )
+            detail_columns = ["Signal date", "Signal", "Score bucket", "Signal score", "1D return", "3D return", "5D return", "10D return"]
+            st.dataframe(
+                observations[detail_columns].tail(100).style.format({column: "{:.2%}" for column in detail_columns[4:]}),
+                use_container_width=True,
+                hide_index=True,
+                height=280,
+            )
+
+
+def render_premium_sentiment(controls: dict[str, Any] | None = None) -> None:
+    controls = controls or {}
+    st.markdown("<div class='terminal-label'>PREMIUM & DIRECTIONAL SENTIMENT BREAKDOWN</div>", unsafe_allow_html=True)
+    st.title("Premium & Directional Sentiment")
+    st.caption("Estimated traded option premium · volume × bid/ask midpoint × 100 shares")
+
+    expiration = controls.get("expiration")
+    symbols = controls.get("symbols", ())
+    run_scan = bool(controls.get("run_scan"))
+    if not expiration:
+        st.warning("No benchmark option expiration is available from the left pane.")
+        return
+    if not run_scan:
+        st.info("Set the filters and run the scan from the left pane.")
+        return
+    if not symbols:
+        st.warning("Enter at least one symbol.")
+        return
+
+    with st.spinner(f"Reading option premium for {len(symbols)} symbols..."):
+        sentiment = scan_premium_sentiment(expiration, symbols)
+    if sentiment.empty:
+        st.warning("No symbols returned usable volume and bid/ask data for this expiry.")
+        return
+
+    st.warning(
+        "This is a current-chain snapshot, not historical last-week premium. Yahoo Finance does not expose historical option trade premium, so do not compare it directly with the supplied historical example."
+    )
+    total_call = float(sentiment["Call Premium"].sum())
+    total_put = float(sentiment["Put Premium"].sum())
+    total = total_call + total_put
+    scanned_tickers = ", ".join(sentiment["Ticker"].tolist())
+    aggregate_bias = "bullish" if total_call > total_put else "bearish" if total_put > total_call else "neutral"
+    st.markdown(
+        f"<div class='premium-scope'><b>AGGREGATION SCOPE</b> · {escape(scanned_tickers)} · {expiration} · {len(sentiment)} TICKERS CONSIDERED</div>",
+        unsafe_allow_html=True,
+    )
+    put_call_ratio = total_put / total_call if total_call else 0.0
+    st.markdown(
+        f"<div class='premium-metric-grid {aggregate_bias}'>"
+        f"<div class='premium-metric-card'><div>ALL TICKERS · TOTAL PREMIUM</div><strong>{money(total)}</strong><span>calls + puts</span></div>"
+        f"<div class='premium-metric-card'><div>ALL TICKERS · CALL PREMIUM</div><strong>{money(total_call)}</strong><span>call-side proxy</span></div>"
+        f"<div class='premium-metric-card'><div>ALL TICKERS · PUT PREMIUM</div><strong>{money(total_put)}</strong><span>put-side proxy</span></div>"
+        f"<div class='premium-metric-card'><div>ALL TICKERS · PUT/CALL</div><strong>{put_call_ratio:.2f}</strong><span>{aggregate_bias.upper()} aggregate bias</span></div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    display = sentiment[[
+        "Ticker", "Call Premium", "Put Premium", "Net Premium", "Call Share",
+        "Put/Call Premium", "Sentiment", "Call Contracts", "Put Contracts", "Quoted Rows",
+    ]].copy()
+    display.columns = [
+        "Ticker", "Call Premium", "Put Premium", "Net Premium", "Call Share",
+        "Put/Call", "Net Bias & Sentiment", "Call Contracts", "Put Contracts", "Quoted Rows",
+    ]
+    st.markdown("<div class='layer-title'>NET INSTITUTIONAL PREMIUM SENTIMENT <span>OBSERVED OPTION VOLUME · QUOTED MIDPOINT PROXY</span></div>", unsafe_allow_html=True)
+
+    def sentiment_style(value: Any) -> str:
+        text = str(value)
+        if text.startswith("BEARISH"):
+            return "background-color: rgba(255, 85, 125, 0.18); color: #ffd7e2;"
+        if text.startswith("BULLISH"):
+            return "background-color: rgba(40, 215, 161, 0.18); color: #dffaf0;"
+        return "background-color: rgba(245, 200, 75, 0.14); color: #f7e9a7;"
+
+    def net_premium_style(value: Any) -> str:
+        number = float(value)
+        if number > 0:
+            return "color: #28d7a1; font-weight: 600;"
+        if number < 0:
+            return "color: #ff557d; font-weight: 600;"
+        return "color: #f5c84b; font-weight: 600;"
+
+    styled = display.style.map(sentiment_style, subset=["Net Bias & Sentiment"]).map(net_premium_style, subset=["Net Premium"]).set_properties(**{
+        "background-color": "#0d151f",
+        "color": "#dce5ef",
+        "border-color": "#243140",
+    }).format({
+        "Call Premium": money,
+        "Put Premium": money,
+        "Net Premium": money,
+        "Call Share": "{:.1%}",
+        "Put/Call": "{:.2f}",
+        "Call Contracts": "{:,}",
+        "Put Contracts": "{:,}",
+        "Quoted Rows": "{:,}",
+    })
+    table_height = min(max(len(display) * 35 + 42, 100), 420)
+    st.dataframe(styled, width="stretch", hide_index=True, height=table_height)
+    st.caption("Premium is a traded-notional proxy based on reported volume and quoted midpoint; it is not confirmed institutional flow or open/close intent.")
+
+
 def main() -> None:
     authenticate()
-    tabs = st.tabs(["Terminal", "Actionable signals", "Institutional layers"])
-    with tabs[0]:
-        render_terminal()
-    with tabs[1]:
-        st.markdown("<div class='terminal-label'>DIRECTIONAL PLAYBOOKS · EXACT EXPIRY UNIVERSE</div>", unsafe_allow_html=True)
-        today = date.today().isoformat()
-        friday = _next_friday()
-        signal_expiry = st.radio("Signal expiry", [today, friday], format_func=lambda value: f"{value} · {'TODAY' if value == today else 'FRIDAY'}", horizontal=True)
-        signal_universe = TODAY_UNIVERSE if signal_expiry == today else tuple(S_AND_P_50)
-        render_actionable_signals(signal_expiry, signal_universe)
-        render_universe_scan(signal_expiry, signal_universe)
-    with tabs[2]:
-        render_institutional_tab()
+    render_navigation_styles()
+    active_view, controls = render_navigation()
+    if controls.get("show_mockups"):
+        render_theme_mockups()
+
+    if active_view == "gamma":
+        render_terminal(controls)
+    elif active_view == "signals":
+        expiration = controls.get("expiration")
+        if expiration:
+            st.markdown("<div class='terminal-label'>DIRECTIONAL PLAYBOOKS · EXACT EXPIRY UNIVERSE</div>", unsafe_allow_html=True)
+            signal_universe = get_signal_universe(expiration)
+            render_actionable_signals(expiration, signal_universe)
+            render_universe_scan(expiration, signal_universe)
+        else:
+            st.warning("No signal expiry is available from the provider.")
+    elif active_view == "dvzr":
+        render_dvzr_dashboard(controls)
+    elif active_view == "premium":
+        render_premium_sentiment(controls)
 
 
 if __name__ == "__main__":

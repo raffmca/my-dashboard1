@@ -1,5 +1,14 @@
 # Gamma Surface
 
+## Version 3.0
+
+- Trading Desk navigation shell with Terminal, Signals, DVZR Scanner, and Premium Sentiment views
+- Shared dark theme, responsive signal cards, score cards, and themed tables across all views
+- NYSE calendar filtering for weekends, holidays, and post-close next-session behavior
+- Point-in-time DVZR forward-return validation for 1D, 3D, 5D, and 10D horizons
+- Premium Sentiment scan using quoted midpoint and reported option volume as a clearly labeled proxy
+- Password gate runs before any dashboard view when `dashboard_password` is configured
+
 Standalone Streamlit dashboard for public options-chain data. It shows dealer gamma exposure by strike, net gamma regime, gamma flip, call wall, put wall, and max-pain positioning.
 
 ## Version 1.1
